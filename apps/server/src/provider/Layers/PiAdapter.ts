@@ -18,10 +18,17 @@ import type {
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
-  ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import { ProviderDriverKind, ProviderInstanceId } from "@t3tools/contracts";
+import {
+  EventId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  RuntimeItemId,
+  RuntimeRequestId,
+  RuntimeTaskId,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
   Cause,
   Data,
@@ -39,6 +46,7 @@ import * as Crypto from "effect/Crypto";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as FileSystem from "effect/FileSystem";
 import * as DateTime from "effect/DateTime";
+import * as Semaphore from "effect/Semaphore";
 
 import { ServerConfig } from "../../config.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -57,6 +65,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import { parsePiAvailableModels } from "./PiProvider.ts";
 import {
   decodePiBridgeEntryFrame,
   makePiBridgeListener,
@@ -119,6 +128,23 @@ interface PiTurnRecord {
   readonly items: Array<unknown>;
 }
 
+/**
+ * Authoritative main-agent usage accumulated across every assistant
+ * `message_end` in one turn. Pi reports each assistant call's totals on
+ * `message_end.message.usage`; `message_update.usage` is a live partial
+ * snapshot that is unsuitable as a turn total (it is not a stable per-call
+ * figure and can double-count on retries).
+ */
+interface PiTurnUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /** Number of assistant messages with any authoritative usage data. */
+  messageCount: number;
+  complete: boolean;
+}
+
 interface PendingExtensionUi {
   readonly nativeId: string;
   readonly method: string;
@@ -138,8 +164,8 @@ interface PiSessionContext {
   turnOutcome: { readonly state: "completed" | "failed"; readonly error?: string } | undefined;
   pumpFiber: Fiber.Fiber<void, never> | undefined;
   pendingExtensionUi: Map<string, PendingExtensionUi>;
-  /** Latest cumulative usage from message_update events. */
-  lastUsage: Record<string, unknown> | undefined;
+  /** Authoritative assistant usage accumulated across this turn's `message_end`s. */
+  turnUsage: PiTurnUsage | undefined;
   currentModel: string | undefined;
   currentThinkingLevel: string | undefined;
   bridge: PiBridgeListener | undefined;
@@ -161,7 +187,7 @@ interface PiSessionContext {
   consumedResultIdentities: Set<string>;
 }
 
-const canonicalItemTypeForTool = (toolName: string): string => {
+const canonicalItemTypeForTool = (toolName: string) => {
   const name = toolName.toLowerCase();
   if (name === "bash" || name === "powershell") return "command_execution";
   if (name === "edit" || name === "write") return "file_change";
@@ -188,6 +214,25 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   const boundInstanceId = options.instanceId;
 
   const sessions = new Map<string, PiSessionContext>();
+  // One-flight guard per thread: concurrent startSession calls for the same
+  // thread share a lock, so a second spawn cannot start before the first has
+  // registered its session (`sessions.set` happens only after `get_state`).
+  const startSessionLocks = new Map<string, Semaphore.Semaphore>();
+  const acquireStartLock = (threadId: string): Semaphore.Semaphore => {
+    const existing = startSessionLocks.get(threadId);
+    if (existing !== undefined) return existing;
+    const lock = Semaphore.makeUnsafe(1);
+    startSessionLocks.set(threadId, lock);
+    return lock;
+  };
+  /**
+   * Remove a session only when the map still holds this exact context, so a
+   * retire/reap from an older generation can never delete the newer
+   * generation that replaced it.
+   */
+  const deleteSessionIfCurrent = (ctx: PiSessionContext) => {
+    if (sessions.get(ctx.threadId) === ctx) sessions.delete(ctx.threadId);
+  };
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -208,25 +253,31 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
     PubSub.publish(runtimeEventPubSub, event);
 
-  interface EmitInput {
-    readonly type: ProviderRuntimeEvent["type"];
+  type EmitInput = {
+    [Type in ProviderRuntimeEvent["type"]]: {
+      readonly type: Type;
+      readonly payload: Extract<ProviderRuntimeEvent, { type: Type }>["payload"];
+    };
+  }[ProviderRuntimeEvent["type"]] & {
     readonly turnId?: TurnId | undefined;
     readonly itemId?: string | undefined;
     readonly requestId?: string | undefined;
-    readonly payload: unknown;
-  }
+  };
 
   const emitEvent = (threadId: string, event: EmitInput) =>
     Effect.gen(function* () {
       const stamp = yield* makeEventStamp();
+      const { itemId, requestId, ...body } = event;
       const full = {
-        eventId: stamp.eventId,
+        ...body,
+        eventId: EventId.make(stamp.eventId),
         provider: PROVIDER,
         ...(boundInstanceId !== undefined ? { providerInstanceId: boundInstanceId } : {}),
-        threadId,
+        threadId: ThreadId.make(threadId),
         createdAt: stamp.createdAt,
-        ...event,
-      } as ProviderRuntimeEvent;
+        ...(itemId !== undefined ? { itemId: RuntimeItemId.make(itemId) } : {}),
+        ...(requestId !== undefined ? { requestId: RuntimeRequestId.make(requestId) } : {}),
+      } satisfies ProviderRuntimeEvent;
       yield* offerRuntimeEvent(full);
     });
 
@@ -316,7 +367,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             type: "task.started",
             turnId: ctx.activeTurnId,
             payload: {
-              taskId: frame.childId,
+              taskId: RuntimeTaskId.make(frame.childId),
               description: frame.title,
               taskType: "subagent",
               agentKind: "agent",
@@ -335,7 +386,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             type: "task.updated",
             turnId: ctx.activeTurnId,
             payload: {
-              taskId: frame.childId,
+              taskId: RuntimeTaskId.make(frame.childId),
               status: normalizeChildStatus(frame.status),
               ...(frame.errorText !== undefined ? { error: frame.errorText } : {}),
               taskType: "subagent",
@@ -353,7 +404,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             type: "task.transcript",
             turnId: ctx.activeTurnId,
             payload: {
-              taskId: frame.childId,
+              taskId: RuntimeTaskId.make(frame.childId),
               runId,
               taskType: "subagent",
               seq: frame.seq,
@@ -365,7 +416,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             type: "task.progress",
             turnId: ctx.activeTurnId,
             payload: {
-              taskId: frame.childId,
+              taskId: RuntimeTaskId.make(frame.childId),
               description: "child activity",
               typedUsage: frame.tokens === undefined ? undefined : { totalTokens: frame.tokens },
               taskType: "subagent",
@@ -380,7 +431,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
             type: "task.completed",
             turnId: ctx.activeTurnId,
             payload: {
-              taskId: frame.childId,
+              taskId: RuntimeTaskId.make(frame.childId),
               status:
                 frame.status === "done"
                   ? "completed"
@@ -462,7 +513,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           type: "task.updated",
           turnId: ctx.activeTurnId,
           payload: {
-            taskId: childId,
+            taskId: RuntimeTaskId.make(childId),
             status: "interrupted",
             taskType: "subagent",
             agentKind: "agent",
@@ -510,7 +561,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         yield* Fiber.interrupt(ctx.pumpFiber).pipe(Effect.ignore);
       }
       yield* closePiRpcConnection(ctx.connection);
-      sessions.delete(ctx.threadId);
+      deleteSessionIfCurrent(ctx);
       updateSession(ctx, { status: "closed" });
       yield* emitEvent(ctx.threadId, {
         type: "session.exited",
@@ -534,173 +585,221 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       yield* retireGeneration(ctx, "stopped");
     }).pipe(Effect.ignore);
 
+  /**
+   * Close the connection scope only after the event pump fiber has finished.
+   * The pump owns the natural-exit cleanup path and is itself forked into
+   * `connection.scope`; closing that scope inline would interrupt the very
+   * fiber running the close. A detached reaper waits for the pump (natural
+   * exit returns it, stop/interrupt interrupts it), then closes the scope so
+   * the child-kill and bridge-close finalizers run exactly once and the scope
+   * cannot leak.
+   */
+  const reapConnectionAfterPump = (ctx: PiSessionContext, pumpFiber: Fiber.Fiber<void, never>) =>
+    Effect.gen(function* () {
+      yield* Fiber.await(pumpFiber);
+      yield* closePiRpcConnection(ctx.connection);
+    });
+
   const startSession = (
     input: ProviderSessionStartInput,
   ): Effect.Effect<ProviderSession, ProviderAdapterError> =>
-    Effect.gen(function* () {
-      const cwd = input.cwd ?? serverConfig.cwd;
-      const existing = sessions.get(input.threadId);
-      if (existing !== undefined) {
-        yield* stopSessionInternal(existing);
-      }
-      const resume = parsePiResume(input.resumeCursor);
+    acquireStartLock(input.threadId).withPermit(
+      Effect.gen(function* () {
+        const cwd = input.cwd ?? serverConfig.cwd;
+        const existing = sessions.get(input.threadId);
+        if (existing !== undefined) {
+          // Under the per-thread lock a fully started session is a prior
+          // winner: reuse it instead of spawning a second process. A stopped
+          // (still retiring) one is torn down before the fresh spawn below.
+          if (!existing.stopped) {
+            return existing.session;
+          }
+          yield* stopSessionInternal(existing);
+        }
+        const resume = parsePiResume(input.resumeCursor);
 
-      // The bridge listener is created before the child process so its
-      // credentials can ride the spawn environment; its scope is tied to the
-      // connection scope so both retire together.
-      const bridge = yield* makePiBridgeListener({
-        threadId: input.threadId,
-        instanceId: boundInstanceId,
-      }).pipe(
-        Effect.mapError(
-          (cause): ProviderAdapterError =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: input.threadId,
-              detail: cause.message,
-              cause,
-            }),
-        ),
-      );
-
-      const connection = yield* makePiRpcConnectionIn({
-        binaryPath: piSettings.binaryPath,
-        args: buildSpawnArgs({ resume, sessionName: input.title }),
-        cwd,
-        env: { ...profileEnv(), ...bridge.env },
-      }).pipe(
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        Effect.mapError(
-          (cause): ProviderAdapterError =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: input.threadId,
-              detail: cause.message,
-              cause,
-            }),
-        ),
-        // No connection scope exists yet if the spawn fails; retire the bridge
-        // listener so its TCP socket does not leak.
-        Effect.tapError(() => Scope.close(bridge.scope, Exit.void).pipe(Effect.ignore)),
-      );
-      // Tie bridge teardown to the connection scope so the listener dies with
-      // the child process (explicit scope — no ambient Scope requirement).
-      yield* Scope.addFinalizer(connection.scope, Scope.close(bridge.scope, Exit.void));
-
-      // Everything after acquisition is guarded: a get_state failure (timeout,
-      // command error) fully retires the connection (and bridge via finalizer)
-      // and unregisters the half-built session, so nothing leaks.
-      return yield* Effect.gen(function* () {
-        const state = yield* connection.request({ type: "get_state" }, { timeoutMs: 15_000 }).pipe(
+        // The bridge listener is created before the child process so its
+        // credentials can ride the spawn environment; its scope is tied to the
+        // connection scope so both retire together.
+        const bridge = yield* makePiBridgeListener({
+          threadId: input.threadId,
+          instanceId: boundInstanceId,
+        }).pipe(
           Effect.mapError(
             (cause): ProviderAdapterError =>
-              new ProviderAdapterRequestError({
+              new ProviderAdapterProcessError({
                 provider: PROVIDER,
-                method: "get_state",
+                threadId: input.threadId,
                 detail: cause.message,
                 cause,
               }),
           ),
         );
 
-        const createdAt = yield* nowIso;
-        const ctx: PiSessionContext = {
-          threadId: input.threadId,
-          scope: connection.scope,
-          connection,
-          session: {
-            provider: PROVIDER,
-            ...(boundInstanceId !== undefined ? { providerInstanceId: boundInstanceId } : {}),
-            status: "connecting",
-            runtimeMode: input.runtimeMode,
-            cwd,
-            threadId: input.threadId,
-            createdAt,
-            updatedAt: createdAt,
-          },
-          turns: [],
-          activeTurnId: undefined,
-          promptsInFlight: 0,
-          interruptedTurnIds: new Set(),
-          turnOutcome: undefined,
-          pumpFiber: undefined,
-          pendingExtensionUi: new Map(),
-          lastUsage: undefined,
-          currentModel: undefined,
-          currentThinkingLevel: undefined,
-          bridge,
-          stopped: false,
-          exited: false,
-          childSettlement: undefined,
-          openChildIds: new Set(),
-          consumedResultIdentities: new Set(),
-        };
-
-        const sessionFile =
-          typeof state?.["sessionFile"] === "string" ? (state["sessionFile"] as string) : undefined;
-        const sessionId =
-          typeof state?.["sessionId"] === "string" ? (state["sessionId"] as string) : undefined;
-        const model = state?.["model"] as Record<string, unknown> | undefined;
-        const modelId =
-          typeof model?.["id"] === "string" && typeof model?.["provider"] === "string"
-            ? `${model["provider"]}/${model["id"]}`
-            : undefined;
-        const thinkingLevel =
-          typeof state?.["thinkingLevel"] === "string"
-            ? (state["thinkingLevel"] as string)
-            : undefined;
-        ctx.currentModel = modelId;
-        ctx.currentThinkingLevel = thinkingLevel;
-
-        updateSession(ctx, {
-          status: "ready",
-          ...(modelId !== undefined ? { model: modelId } : {}),
-          resumeCursor: sessionFile
-            ? { schemaVersion: PI_RESUME_VERSION, sessionFile, ...(sessionId ? { sessionId } : {}) }
-            : undefined,
-        });
-
-        // Register only after get_state proved the process responsive, so a
-        // failure above never leaves a half-built session behind.
-        sessions.set(input.threadId, ctx);
-
-        // Apply an explicit model selection after the session exists so the
-        // picker drives Pi's own provider/model identity.
-        if (input.modelSelection !== undefined) {
-          yield* applyModelSelection(ctx, input.modelSelection).pipe(Effect.ignore);
-        }
-
-        yield* emitEvent(input.threadId, {
-          type: "session.started",
-          payload: resume !== undefined ? { resume: { sessionFile } } : {},
-        });
-        yield* emitEvent(input.threadId, {
-          type: "session.state.changed",
-          payload: { state: "ready" },
-        });
-        yield* emitEvent(input.threadId, {
-          type: "thread.started",
-          payload: sessionFile !== undefined ? { providerThreadId: sessionFile } : {},
-        });
-
-        // The extension-UI waiter forks scoped work (`Effect.forkScoped`), so
-        // the pump needs this session's Scope in its context; provide it here
-        // rather than leaking an ambient Scope requirement onto startSession.
-        ctx.pumpFiber = yield* Effect.forkIn(
-          runEventPump(ctx).pipe(Effect.provideService(Scope.Scope, connection.scope)),
-          connection.scope,
+        const connection = yield* makePiRpcConnectionIn({
+          binaryPath: piSettings.binaryPath,
+          args: buildSpawnArgs({ resume, sessionName: input.title }),
+          cwd,
+          env: { ...profileEnv(), ...bridge.env },
+        }).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.mapError(
+            (cause): ProviderAdapterError =>
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: input.threadId,
+                detail: cause.message,
+                cause,
+              }),
+          ),
+          // Until the connection owns the listener, all failed acquisitions
+          // (including interruption) must release it in an uninterruptible finalizer.
+          Effect.onError(() => Scope.close(bridge.scope, Exit.void).pipe(Effect.ignore)),
         );
 
-        return ctx.session;
-      }).pipe(
-        Effect.tapError(() =>
-          Effect.gen(function* () {
-            sessions.delete(input.threadId);
-            yield* closePiRpcConnection(connection);
-          }).pipe(Effect.ignore),
-        ),
-      );
-    });
+        // Everything after acquisition is guarded all-cause: a get_state
+        // failure, defect, or interruption fully retires the connection (and
+        // bridge) and unregisters the half-built session.
+        return yield* Effect.gen(function* () {
+          // Tie bridge teardown to the connection scope so the listener dies
+          // with the child process (explicit scope — no ambient Scope need).
+          yield* Scope.addFinalizer(connection.scope, Scope.close(bridge.scope, Exit.void));
+          const state = yield* connection
+            .request({ type: "get_state" }, { timeoutMs: 15_000 })
+            .pipe(
+              Effect.mapError(
+                (cause): ProviderAdapterError =>
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "get_state",
+                    detail: cause.message,
+                    cause,
+                  }),
+              ),
+            );
+
+          const createdAt = yield* nowIso;
+          const ctx: PiSessionContext = {
+            threadId: input.threadId,
+            scope: connection.scope,
+            connection,
+            session: {
+              provider: PROVIDER,
+              ...(boundInstanceId !== undefined ? { providerInstanceId: boundInstanceId } : {}),
+              status: "connecting",
+              runtimeMode: input.runtimeMode,
+              cwd,
+              threadId: input.threadId,
+              createdAt,
+              updatedAt: createdAt,
+            },
+            turns: [],
+            activeTurnId: undefined,
+            promptsInFlight: 0,
+            interruptedTurnIds: new Set(),
+            turnOutcome: undefined,
+            pumpFiber: undefined,
+            pendingExtensionUi: new Map(),
+            turnUsage: undefined,
+            currentModel: undefined,
+            currentThinkingLevel: undefined,
+            bridge,
+            stopped: false,
+            exited: false,
+            childSettlement: undefined,
+            openChildIds: new Set(),
+            consumedResultIdentities: new Set(),
+          };
+
+          const sessionFile =
+            typeof state?.["sessionFile"] === "string"
+              ? (state["sessionFile"] as string)
+              : undefined;
+          const sessionId =
+            typeof state?.["sessionId"] === "string" ? (state["sessionId"] as string) : undefined;
+          const model = state?.["model"] as Record<string, unknown> | undefined;
+          const modelId =
+            typeof model?.["id"] === "string" && typeof model?.["provider"] === "string"
+              ? `${model["provider"]}/${model["id"]}`
+              : undefined;
+          const thinkingLevel =
+            typeof state?.["thinkingLevel"] === "string"
+              ? (state["thinkingLevel"] as string)
+              : undefined;
+          ctx.currentModel = modelId;
+          ctx.currentThinkingLevel = thinkingLevel;
+
+          updateSession(ctx, {
+            status: "ready",
+            ...(modelId !== undefined ? { model: modelId } : {}),
+            resumeCursor: sessionFile
+              ? {
+                  schemaVersion: PI_RESUME_VERSION,
+                  sessionFile,
+                  ...(sessionId ? { sessionId } : {}),
+                }
+              : undefined,
+          });
+
+          // Register only after get_state proved the process responsive, so a
+          // failure above never leaves a half-built session behind.
+          sessions.set(input.threadId, ctx);
+
+          // Apply an explicit model selection after the session exists so the
+          // picker drives Pi's own provider/model identity.
+          if (input.modelSelection !== undefined) {
+            yield* applyModelSelection(ctx, input.modelSelection).pipe(Effect.ignore);
+          }
+
+          yield* emitEvent(input.threadId, {
+            type: "session.started",
+            payload: resume !== undefined ? { resume: { sessionFile } } : {},
+          });
+          yield* emitEvent(input.threadId, {
+            type: "session.state.changed",
+            payload: { state: "ready" },
+          });
+          yield* emitEvent(input.threadId, {
+            type: "thread.started",
+            payload: sessionFile !== undefined ? { providerThreadId: sessionFile } : {},
+          });
+
+          // The extension-UI waiter forks scoped work (`Effect.forkScoped`), so
+          // the pump needs this session's Scope in its context; provide it here
+          // rather than leaking an ambient Scope requirement onto startSession.
+          ctx.pumpFiber = yield* Effect.forkIn(
+            runEventPump(ctx).pipe(Effect.provideService(Scope.Scope, connection.scope)),
+            connection.scope,
+          );
+
+          // Reap the connection scope only after the pump finishes (natural exit
+          // or interrupt); see reapConnectionAfterPump.
+          yield* reapConnectionAfterPump(ctx, ctx.pumpFiber).pipe(Effect.forkDetach);
+
+          const modelCatalog = options.modelCatalog;
+          if (modelCatalog !== undefined) {
+            yield* connection
+              .request({ type: "get_available_models" }, { timeoutMs: 20_000 })
+              .pipe(
+                Effect.map(parsePiAvailableModels),
+                Effect.flatMap(modelCatalog.set),
+                Effect.ignore,
+                Effect.forkIn(connection.scope),
+              );
+          }
+
+          return ctx.session;
+        }).pipe(
+          Effect.onError(() =>
+            Effect.gen(function* () {
+              sessions.delete(input.threadId);
+              yield* closePiRpcConnection(connection);
+              yield* Scope.close(bridge.scope, Exit.void).pipe(Effect.ignore);
+            }).pipe(Effect.ignore),
+          ),
+        );
+      }),
+    );
 
   const applyModelSelection = (
     ctx: PiSessionContext,
@@ -714,7 +813,13 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       const separatorIndex = raw.indexOf("/");
       const provider = separatorIndex > 0 ? raw.slice(0, separatorIndex) : undefined;
       const modelId = separatorIndex > 0 ? raw.slice(separatorIndex + 1) : raw;
-      if (provider !== undefined && modelId.length > 0) {
+      // A synthetic slug (no `provider/model` split) is a T3-side "Pi-native
+      // default" marker, not a concrete model identity. It must never
+      // overwrite the session's real model, which Pi publishes via get_state
+      // and later `message_end`. Only a concrete `provider/model` selects and
+      // re-labels the session.
+      const isConcreteModel = provider !== undefined && modelId.length > 0;
+      if (isConcreteModel) {
         yield* ctx.connection
           .request({ type: "set_model", provider, modelId }, { timeoutMs: 10_000 })
           .pipe(Effect.ignore);
@@ -726,7 +831,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           .pipe(Effect.ignore);
         ctx.currentThinkingLevel = effort.value;
       }
-      updateSession(ctx, { model: raw });
+      if (isConcreteModel) {
+        updateSession(ctx, { model: raw });
+      }
     });
 
   // --- Event pump ------------------------------------------------------------
@@ -745,7 +852,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         status: state === "failed" ? "error" : "ready",
         activeTurnId: undefined,
       });
-      const usage = ctx.lastUsage;
+      const usage = ctx.turnUsage;
+      const settled = state === "completed";
       yield* emitEvent(ctx.threadId, {
         type: "turn.completed",
         turnId,
@@ -753,10 +861,15 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           state,
           ...(options.stopReason !== undefined ? { stopReason: options.stopReason } : {}),
           ...(options.errorMessage !== undefined ? { errorMessage: options.errorMessage } : {}),
-          ...(usage !== undefined ? { usage } : {}),
-          tokenUsage: buildTurnTokenUsage(usage),
+          ...(usage !== undefined && usage.messageCount > 0
+            ? { usage: turnUsageRecord(usage) }
+            : {}),
+          tokenUsage: buildTurnTokenUsage(usage, settled),
         },
       });
+      // The just-emitted counts are this turn's total; clear them so a later
+      // continuation or the next turn cannot leak this turn's usage.
+      ctx.turnUsage = undefined;
     });
 
   /**
@@ -770,6 +883,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       ctx.activeTurnId = turnId;
       ctx.promptsInFlight += 1;
       ctx.turnOutcome = undefined;
+      ctx.turnUsage = undefined;
       ctx.turns.push({ id: turnId, items: [] });
       updateSession(ctx, { status: "running", activeTurnId: turnId });
       yield* emitEvent(ctx.threadId, {
@@ -793,6 +907,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       if (ctx.promptsInFlight > 0) ctx.promptsInFlight -= 1;
       ctx.activeTurnId = undefined;
       ctx.turnOutcome = undefined;
+      ctx.turnUsage = undefined;
       ctx.turns = ctx.turns.filter((turn) => turn.id !== turnId);
       updateSession(ctx, { status: "ready", activeTurnId: undefined });
       yield* emitEvent(ctx.threadId, {
@@ -802,28 +917,85 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       });
     });
 
-  const buildTurnTokenUsage = (usage: Record<string, unknown> | undefined) => {
-    if (usage === undefined) return undefined;
-    const input = numberOrUndefined(usage["input"]);
-    const output = numberOrUndefined(usage["output"]);
-    if (input === undefined && output === undefined) return undefined;
+  const numberOrUndefined = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+
+  const emptyTurnUsage = (): PiTurnUsage => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    messageCount: 0,
+    complete: true,
+  });
+
+  /**
+   * Add one authoritative assistant `message_end` usage to the turn. Only the
+   * `message_end` record is accumulated; `message_update` stays a live display
+   * value so a replayed partial snapshot can never be counted twice alongside
+   * the authoritative total.
+   */
+  const accumulateTurnUsage = (
+    ctx: PiSessionContext,
+    usage: Record<string, unknown> | undefined,
+  ): void => {
+    const input = numberOrUndefined(usage?.["input"]);
+    const output = numberOrUndefined(usage?.["output"]);
+    const cacheRead = numberOrUndefined(usage?.["cacheRead"]);
+    const cacheWrite = numberOrUndefined(usage?.["cacheWrite"]);
+    const acc = ctx.turnUsage ?? emptyTurnUsage();
+    acc.inputTokens += input ?? 0;
+    acc.outputTokens += output ?? 0;
+    acc.cacheReadTokens += cacheRead ?? 0;
+    acc.cacheWriteTokens += cacheWrite ?? 0;
+    if ([input, output, cacheRead, cacheWrite].some((count) => count !== undefined)) {
+      acc.messageCount += 1;
+    }
+    acc.complete &&=
+      input !== undefined &&
+      output !== undefined &&
+      (usage?.["cacheRead"] === undefined || cacheRead !== undefined) &&
+      (usage?.["cacheWrite"] === undefined || cacheWrite !== undefined);
+    ctx.turnUsage = acc;
+  };
+
+  /**
+   * Project accumulated turn usage into `TurnTokenUsage`. `inputTokens`
+   * includes cache reads and writes (matching the contract's "input includes
+   * cache reads and writes"); `cachedInputTokens`/`cacheCreationTokens` stay
+   * separate for the UI. A turn is only "complete" when it settled
+   * successfully and authoritative usage exists; a failed/interrupted turn or
+   * one with no assistant `message_end` is "partial"/"unavailable" — never
+   * marked complete from a live partial snapshot.
+   */
+  const buildTurnTokenUsage = (usage: PiTurnUsage | undefined, complete: boolean) => {
+    if (usage === undefined || usage.messageCount === 0) {
+      return {
+        usageScope: "main_agent" as const,
+        usageStatus: "unavailable" as const,
+        hasSubagents: false,
+      };
+    }
     return {
       usageScope: "main_agent" as const,
-      usageStatus: "complete" as const,
+      usageStatus: complete && usage.complete ? ("complete" as const) : ("partial" as const),
       hasSubagents: false,
-      ...(input !== undefined ? { inputTokens: input } : {}),
-      ...(output !== undefined ? { outputTokens: output } : {}),
-      ...cachedTokens(usage),
+      inputTokens: usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens,
+      outputTokens: usage.outputTokens,
+      ...(usage.cacheReadTokens > 0 ? { cachedInputTokens: usage.cacheReadTokens } : {}),
+      ...(usage.cacheWriteTokens > 0 ? { cacheCreationTokens: usage.cacheWriteTokens } : {}),
     };
   };
 
-  const cachedTokens = (usage: Record<string, unknown>) => {
-    const cacheRead = numberOrUndefined(usage["cacheRead"]);
-    return cacheRead !== undefined ? { cachedInputTokens: cacheRead } : {};
-  };
-
-  const numberOrUndefined = (value: unknown): number | undefined =>
-    typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  /** Debug-friendly raw usage record, mirroring Pi's `Usage` field shape. */
+  const turnUsageRecord = (usage: PiTurnUsage): Record<string, unknown> => ({
+    input: usage.inputTokens,
+    output: usage.outputTokens,
+    cacheRead: usage.cacheReadTokens,
+    cacheWrite: usage.cacheWriteTokens,
+    totalTokens:
+      usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens,
+  });
 
   const runEventPump = (ctx: PiSessionContext) =>
     Effect.gen(function* () {
@@ -955,7 +1127,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     Effect.gen(function* () {
       const usage = value["usage"];
       if (typeof usage === "object" && usage !== null) {
-        ctx.lastUsage = usage as Record<string, unknown>;
         const totalTokens = numberOrUndefined((usage as Record<string, unknown>)["totalTokens"]);
         if (totalTokens !== undefined) {
           yield* emitEvent(ctx.threadId, {
@@ -1028,6 +1199,13 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       if (record["role"] !== "assistant") return;
       const turnId = ctx.activeTurnId;
       if (turnId === undefined) return;
+      const usage = record["usage"];
+      accumulateTurnUsage(
+        ctx,
+        typeof usage === "object" && usage !== null
+          ? (usage as Record<string, unknown>)
+          : undefined,
+      );
       const modelId =
         typeof record["model"] === "string" && typeof record["provider"] === "string"
           ? `${record["provider"]}/${record["model"]}`
@@ -1198,15 +1376,14 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           errorMessage: stderrTail.length > 0 ? stderrTail.slice(-400) : "Pi process exited",
         });
       }
-      // Retire the bridge listener now that the process is gone. Do NOT close
-      // `connection.scope` here: this handler runs inside the pump fiber, which
-      // is forked in that scope, so closing it inline would self-interrupt. The
-      // process already exited and its stream/exit fibers completed; `exited`
-      // ends the pump loop on this iteration, so nothing is left behind.
-      if (ctx.bridge !== undefined) {
-        yield* Scope.close(ctx.bridge.scope, Exit.void).pipe(Effect.ignore);
-      }
-      sessions.delete(ctx.threadId);
+      // The process is gone; `exited` ends the pump loop on this iteration. Do
+      // NOT close `connection.scope` inline: this handler runs inside the pump
+      // fiber, which is forked into that scope, so closing it would self-
+      // interrupt. The detached reaper (see reapConnectionAfterPump) closes
+      // the scope — and, through its finalizers, the bridge listener and the
+      // child process — only after this pump fiber has finished, so the scope
+      // cannot leak.
+      deleteSessionIfCurrent(ctx);
       updateSession(ctx, { status: "error" });
       yield* emitEvent(ctx.threadId, {
         type: "session.exited",
@@ -1409,6 +1586,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           ctx.activeTurnId = turnId;
           ctx.promptsInFlight += 1;
           ctx.turnOutcome = undefined;
+          ctx.turnUsage = undefined;
           ctx.turns.push({ id: turnId, items: [] });
           updateSession(ctx, { status: "running", activeTurnId: turnId });
           yield* emitEvent(input.threadId, {

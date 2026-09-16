@@ -2770,6 +2770,7 @@ export default function ChatView(props: ChatViewProps) {
   } = useChildAgentRoster(
     activeThreadRef?.environmentId ?? null,
     activeThreadRef?.threadId ?? null,
+    selectedProvider,
   );
   const agentLiveCount = useMemo(
     () => mergeProviderChildren(agentPanelModel, providerChildren).liveCount,

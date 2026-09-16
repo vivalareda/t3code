@@ -11,12 +11,15 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { afterAll } from "vite-plus/test";
 
 import { ServerConfig } from "../../config.ts";
@@ -39,6 +42,9 @@ const fixtureDirectories: Array<string> = [];
 const REQUEST_ID = ApprovalRequestId.make("q1");
 const THREAD_ID = ThreadId.make("thread-pi-adapter-1");
 const TEST_INSTANCE_ID = ProviderInstanceId.make("pi-test");
+// Process-group SIGTERM signalling differs on Windows; the OS-level
+// process-reaped assertion is skipped there.
+const windowsHost = HostProcessPlatform.defaultValue() === "win32";
 
 /**
  * Scriptable fake `pi --mode rpc` process. Behaviour is driven by JSONL
@@ -117,7 +123,15 @@ function handleLine(line) {
       return;
     }
     respond(id, type, true);
-    emitFile(promptEventsPath);
+    if (String(cmd.message ?? "").startsWith("FAKE_EVENTS:")) {
+      for (const event of JSON.parse(cmd.message.slice("FAKE_EVENTS:".length))) send(event);
+    } else {
+      emitFile(promptEventsPath);
+    }
+    if (process.env.FAKE_PI_EXIT_AFTER_PROMPT === "1") {
+      process.stdout.write("\\n", () => process.exit(9));
+      return;
+    }
     if (lateEventsPath && lateDelayMs > 0) {
       setTimeout(() => emitFile(lateEventsPath), lateDelayMs);
     }
@@ -307,6 +321,11 @@ const assistantMessageEnd = (
   message: { role: "assistant", stopReason, ...extra },
 });
 
+const messageUpdateWithUsage = (usage: Record<string, unknown>): Record<string, unknown> => ({
+  type: "message_update",
+  usage,
+});
+
 const subagentResultMessage = (childId: string, content: string): Record<string, unknown> => ({
   role: "custom",
   customType: "subagent-result",
@@ -387,20 +406,22 @@ function makeCollector(adapter: ProviderAdapterShape<ProviderAdapterError>) {
   });
 }
 
-const runWithFake = (
-  scenario: {
-    readonly startEvents?: Array<Record<string, unknown>>;
-    readonly promptEvents?: Array<Record<string, unknown>>;
-    readonly lateEvents?: Array<Record<string, unknown>>;
-    readonly lateDelayMs?: number;
-    readonly exitAfterMs?: number;
-  },
-  fn: (harness: AdapterHarness) => Effect.Effect<void, ProviderAdapterError>,
-) => {
+type PiFakeScenario = {
+  readonly startEvents?: Array<Record<string, unknown>>;
+  readonly promptEvents?: Array<Record<string, unknown>>;
+  readonly lateEvents?: Array<Record<string, unknown>>;
+  readonly lateDelayMs?: number;
+  readonly exitAfterMs?: number;
+  readonly exitAfterPrompt?: boolean;
+};
+
+/** Build the adapter + collector against a fake `pi` without auto-starting. */
+const makeFakeHarness = (scenario: PiFakeScenario) => {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "pi-adapter-fixture-"));
   fixtureDirectories.push(dir);
   const env: Record<string, string> = {
     FAKE_PI_LOG: NodePath.join(dir, "commands.jsonl"),
+    FAKE_PI_EXIT_AFTER_PROMPT: scenario.exitAfterPrompt ? "1" : "0",
   };
   if (scenario.startEvents !== undefined) {
     env["FAKE_PI_START_EVENTS"] = writeScenario(dir, "start.jsonl", scenario.startEvents);
@@ -420,19 +441,37 @@ const runWithFake = (
   const layer = Layer.provideMerge(ServerConfig.layerTest(dir, dir), NodeServices.layer);
 
   return Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const released = yield* Deferred.make<void>();
+    const observedSpawner = ChildProcessSpawner.make((command) =>
+      spawner
+        .spawn(command)
+        .pipe(Effect.tap(() => Effect.addFinalizer(() => Deferred.succeed(released, undefined)))),
+    );
     const adapter = yield* makePiAdapter(
       { enabled: true, binaryPath: launcher, profileDir: "", customModels: [] },
       { instanceId: TEST_INSTANCE_ID },
-    );
+    ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observedSpawner));
     const collector = yield* makeCollector(adapter);
-    yield* adapter.startSession({ threadId: THREAD_ID, runtimeMode: "full-access" });
-    return yield* fn({
+    return {
       adapter,
       waitUntil: collector.waitUntil,
       events: collector.events,
-    });
+      released: Deferred.await(released),
+      dir,
+    };
   }).pipe(Effect.provide(layer));
 };
+
+const runWithFake = (
+  scenario: PiFakeScenario,
+  fn: (harness: AdapterHarness) => Effect.Effect<void, ProviderAdapterError>,
+) =>
+  Effect.gen(function* () {
+    const harness = yield* makeFakeHarness(scenario);
+    yield* harness.adapter.startSession({ threadId: THREAD_ID, runtimeMode: "full-access" });
+    return yield* fn(harness);
+  });
 
 const runWithInterruptFake = (
   fn: (harness: AdapterHarness) => Effect.Effect<void, ProviderAdapterError>,
@@ -456,6 +495,114 @@ const runWithInterruptFake = (
   }).pipe(Effect.provide(layer));
 };
 
+/** A fake `pi` that reports its pid then hangs forever on `get_state`. */
+const HANG_GET_STATE_SOURCE = `
+import { appendFileSync } from "node:fs";
+
+const logPath = process.env.FAKE_PI_LOG;
+const pidPath = process.env.FAKE_PI_PID_FILE;
+if (pidPath) { try { appendFileSync(pidPath, String(process.pid)); } catch {} }
+
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let i = buffer.indexOf("\\n");
+  while (i >= 0) {
+    const line = buffer.slice(0, i);
+    buffer = buffer.slice(i + 1);
+    if (line.trim().length > 0) {
+      let cmd;
+      try { cmd = JSON.parse(line); } catch { cmd = null; }
+      if (cmd !== null && logPath) {
+        try { appendFileSync(logPath, JSON.stringify(cmd) + "\\n"); } catch {}
+      }
+      // Deliberately never answer get_state: startSession stays suspended so
+      // an interrupt can land mid-startup.
+    }
+    i = buffer.indexOf("\\n");
+  }
+});
+`;
+
+const runWithHangingFake = () => {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "pi-hang-fixture-"));
+  fixtureDirectories.push(dir);
+  const pidFile = NodePath.join(dir, "pid.txt");
+  const launcher = makeFakePi(
+    dir,
+    {
+      FAKE_PI_LOG: NodePath.join(dir, "commands.jsonl"),
+      FAKE_PI_PID_FILE: pidFile,
+    },
+    HANG_GET_STATE_SOURCE,
+  );
+  const layer = Layer.provideMerge(ServerConfig.layerTest(dir, dir), NodeServices.layer);
+  return Effect.gen(function* () {
+    const adapter = yield* makePiAdapter(
+      { enabled: true, binaryPath: launcher, profileDir: "", customModels: [] },
+      { instanceId: TEST_INSTANCE_ID },
+    );
+    return { adapter, pidFile };
+  }).pipe(Effect.provide(layer));
+};
+
+/**
+ * Event-driven rendezvous on the fake child's marker file. `fs.watch` fires on
+ * the directory when the child creates the file, so this never polls or sleeps;
+ * the 10s bound is only a hang guard. The already-written case is checked once
+ * up front so a child that finished before the watcher attached also resolves.
+ */
+const waitForFileContent = (path: string) =>
+  Effect.promise<string>(
+    () =>
+      new Promise((resolve, reject) => {
+        const dir = NodePath.dirname(path);
+        let done = false;
+        let watcher: NodeFS.FSWatcher | undefined;
+        let timeout: NodeJS.Timeout;
+
+        function cleanup(): void {
+          clearTimeout(timeout);
+          if (watcher !== undefined) {
+            watcher.close();
+            watcher = undefined;
+          }
+        }
+
+        function tryResolve(): boolean {
+          try {
+            const content = NodeFS.readFileSync(path, "utf8").trim();
+            if (content.length > 0) {
+              done = true;
+              cleanup();
+              resolve(content);
+              return true;
+            }
+          } catch {
+            // not written yet
+          }
+          return false;
+        }
+
+        function fail(): void {
+          if (done) return;
+          done = true;
+          cleanup();
+          reject(new Error(`Timed out waiting for file content at ${path}`));
+        }
+
+        // @effect-diagnostics-next-line globalTimers:off - fs.watch rendezvous hang guard, not an Effect-schedulable timer.
+        timeout = setTimeout(fail, 10_000);
+        (timeout as unknown as { unref?: () => void }).unref?.();
+
+        watcher = NodeFS.watch(dir, () => {
+          tryResolve();
+        });
+        tryResolve();
+      }),
+  );
+
 const completedTurns = (events: ReadonlyArray<ProviderRuntimeEvent>) =>
   events.filter((event) => event.type === "turn.completed");
 
@@ -469,6 +616,120 @@ const resolvedFor = (requestId: string) => (events: ReadonlyArray<ProviderRuntim
   events.some((event) => event.type === "user-input.resolved" && event.requestId === requestId);
 
 describe("PiAdapter", () => {
+  it.effect("sums authoritative call usage without counting streaming snapshots twice", () =>
+    runWithFake(
+      {
+        promptEvents: [
+          { type: "agent_start" },
+          { type: "message_update", usage: { input: 999, output: 999, totalTokens: 1998 } },
+          assistantMessageEnd("toolUse", {
+            usage: { input: 5, output: 3, cacheRead: 2, cacheWrite: 3 },
+          }),
+          { type: "message_update", usage: { input: 999, output: 999, totalTokens: 1998 } },
+          assistantMessageEnd("stop", {
+            usage: { input: 7, output: 4, cacheRead: 1, cacheWrite: 0 },
+          }),
+          { type: "agent_settled" },
+        ],
+      },
+      (h) =>
+        Effect.gen(function* () {
+          yield* h.adapter.sendTurn({ threadId: THREAD_ID, input: "review" });
+          yield* h.waitUntil((events) => events.some((event) => event.type === "turn.completed"));
+          const completed = (yield* h.events).find((event) => event.type === "turn.completed");
+          expect(completed?.payload).toMatchObject({
+            usage: { input: 12, output: 7, cacheRead: 3, cacheWrite: 3, totalTokens: 25 },
+            tokenUsage: {
+              usageStatus: "complete",
+              inputTokens: 18,
+              outputTokens: 7,
+              cachedInputTokens: 3,
+              cacheCreationTokens: 3,
+            },
+          });
+        }),
+    ),
+  );
+
+  it.effect(
+    "resets usage for explicit turns and automatic continuations, including zero totals",
+    () =>
+      runWithFake({}, (h) =>
+        Effect.gen(function* () {
+          const sendEvents = (events: Array<Record<string, unknown>>) =>
+            h.adapter.sendTurn({
+              threadId: THREAD_ID,
+              input: `FAKE_EVENTS:${JSON.stringify(events)}`,
+            });
+          yield* sendEvents([
+            { type: "agent_start" },
+            assistantMessageEnd("stop", { usage: { input: 10, output: 2 } }),
+            { type: "agent_settled" },
+            { type: "agent_start" },
+            assistantMessageEnd("stop", {
+              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            }),
+            { type: "agent_settled" },
+          ]);
+          yield* h.waitUntil(
+            (events) => events.filter((event) => event.type === "turn.completed").length === 2,
+          );
+          yield* sendEvents([
+            { type: "agent_start" },
+            assistantMessageEnd("error", { errorMessage: "Provider unavailable" }),
+            { type: "agent_settled" },
+          ]);
+          yield* h.waitUntil(
+            (events) => events.filter((event) => event.type === "turn.completed").length === 3,
+          );
+          const completed = (yield* h.events).filter((event) => event.type === "turn.completed");
+          expect(completed.map((event) => event.payload.tokenUsage)).toEqual([
+            {
+              usageScope: "main_agent",
+              usageStatus: "complete",
+              hasSubagents: false,
+              inputTokens: 10,
+              outputTokens: 2,
+            },
+            {
+              usageScope: "main_agent",
+              usageStatus: "complete",
+              hasSubagents: false,
+              inputTokens: 0,
+              outputTokens: 0,
+            },
+            { usageScope: "main_agent", usageStatus: "unavailable", hasSubagents: false },
+          ]);
+          expect(completed[2]?.payload.state).toBe("failed");
+          expect(completed[2]?.payload.usage).toBeUndefined();
+        }),
+      ),
+  );
+
+  it.effect("reports partial totals when any assistant call is missing usage", () =>
+    runWithFake(
+      {
+        promptEvents: [
+          { type: "agent_start" },
+          assistantMessageEnd("toolUse", { usage: { input: 10, output: 2 } }),
+          assistantMessageEnd("stop", { usage: { output: 3 } }),
+          { type: "agent_settled" },
+        ],
+      },
+      (h) =>
+        Effect.gen(function* () {
+          yield* h.adapter.sendTurn({ threadId: THREAD_ID, input: "review" });
+          yield* h.waitUntil((events) => events.some((event) => event.type === "turn.completed"));
+          const completed = (yield* h.events).find((event) => event.type === "turn.completed");
+          expect(completed?.payload.tokenUsage).toMatchObject({
+            usageStatus: "partial",
+            inputTokens: 10,
+            outputTokens: 5,
+          });
+        }),
+    ),
+  );
+
   it.effect("maps the web client's bare confirm answer to a confirmed response", () =>
     runWithFake(
       { startEvents: [extensionUiRequest("confirm", "q1")] },
@@ -1101,5 +1362,241 @@ describe("PiAdapter", () => {
           expect(runIds[1]).not.toBe(oldRunId);
         }),
       ),
+  );
+
+  it.effect("closes the connection scope after an unexpected process exit", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeFakeHarness({
+        exitAfterPrompt: true,
+        promptEvents: [{ type: "agent_start" }, textDelta("unfinished work")],
+      });
+      yield* harness.adapter.startSession({ threadId: THREAD_ID, runtimeMode: "full-access" });
+      yield* harness.adapter.sendTurn({ threadId: THREAD_ID, input: "crash during this turn" });
+      yield* harness.waitUntil((events) => events.some((event) => event.type === "session.exited"));
+      // Process exit and map deletion alone do not prove resource cleanup:
+      // wait on a finalizer registered inside the connection-owned scope.
+      yield* harness.released;
+      expect(yield* harness.adapter.hasSession(THREAD_ID)).toBe(false);
+      expect(completedTurns(yield* harness.events)[0]?.payload).toMatchObject({
+        state: "failed",
+        stopReason: "process-exited",
+      });
+    }),
+  );
+
+  it.effect("concurrent startSession for the same thread spawns a single process", () =>
+    Effect.gen(function* () {
+      const { adapter, dir } = yield* makeFakeHarness({});
+      const [first, second] = yield* Effect.all(
+        [
+          adapter.startSession({ threadId: THREAD_ID, runtimeMode: "full-access" }),
+          adapter.startSession({ threadId: THREAD_ID, runtimeMode: "full-access" }),
+        ],
+        { concurrency: "unbounded" },
+      );
+      // The second caller reuses the first's session instead of spawning again.
+      expect(first).toBe(second);
+      expect(first.status).toBe("ready");
+
+      const commands = NodeFS.readFileSync(NodePath.join(dir, "commands.jsonl"), "utf8")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as { readonly type?: string });
+      expect(commands.filter((command) => command.type === "get_state").length).toBe(1);
+    }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "interrupting startSession before get_state resolves reaps the spawned process",
+    () =>
+      Effect.gen(function* () {
+        const { adapter, pidFile } = yield* runWithHangingFake();
+        const startFiber = yield* adapter
+          .startSession({ threadId: THREAD_ID, runtimeMode: "full-access" })
+          .pipe(Effect.forkChild);
+
+        // Rendezvous with the child before interrupting.
+        const pid = Number.parseInt(yield* waitForFileContent(pidFile), 10);
+        yield* Fiber.interrupt(startFiber);
+        const exit = yield* Fiber.await(startFiber);
+        expect(Exit.isFailure(exit)).toBe(true);
+
+        // No half-built session survives the interrupted start.
+        expect((yield* adapter.listSessions()).length).toBe(0);
+        expect(yield* adapter.hasSession(THREAD_ID)).toBe(false);
+
+        // All-cause cleanup awaited the child's exit before completing, so the
+        // process is already reaped.
+        expect(() => process.kill(pid, 0)).toThrow();
+      }),
+  );
+
+  it.effect("accumulates authoritative message_end usage across assistant calls", () =>
+    runWithFake(
+      {
+        promptEvents: [
+          { type: "agent_start" },
+          textDelta("first call"),
+          assistantMessageEnd("toolUse", {
+            usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
+          }),
+          textDelta("second call"),
+          assistantMessageEnd("stop", {
+            usage: { input: 50, output: 5, cacheRead: 20, cacheWrite: 30 },
+          }),
+          { type: "agent_settled" },
+        ],
+      },
+      ({ adapter, waitUntil, events }) =>
+        Effect.gen(function* () {
+          yield* adapter.sendTurn({ threadId: THREAD_ID, input: "hello" });
+          yield* waitUntil((seen) => completedTurns(seen).length >= 1);
+          const completed = completedTurns(yield* events)[0];
+          expect(completed?.type).toBe("turn.completed");
+          if (completed?.type !== "turn.completed") return;
+          expect(completed.payload.tokenUsage).toEqual({
+            usageScope: "main_agent",
+            usageStatus: "complete",
+            hasSubagents: false,
+            inputTokens: 200,
+            outputTokens: 15,
+            cachedInputTokens: 20,
+            cacheCreationTokens: 30,
+          });
+        }),
+    ),
+  );
+
+  it.effect("resets turn usage at each explicit turn boundary", () =>
+    runWithFake(
+      {
+        promptEvents: [
+          { type: "agent_start" },
+          textDelta("reply"),
+          assistantMessageEnd("stop", {
+            usage: { input: 100, output: 10, cacheRead: 5, cacheWrite: 5 },
+          }),
+          { type: "agent_settled" },
+        ],
+      },
+      ({ adapter, waitUntil, events }) =>
+        Effect.gen(function* () {
+          yield* adapter.sendTurn({ threadId: THREAD_ID, input: "first" });
+          yield* waitUntil((seen) => completedTurns(seen).length >= 1);
+          yield* adapter.sendTurn({ threadId: THREAD_ID, input: "second" });
+          yield* waitUntil((seen) => completedTurns(seen).length >= 2);
+          const completed = completedTurns(yield* events);
+          expect(completed.length).toBe(2);
+          expect(completed[1]?.type).toBe("turn.completed");
+          if (completed[1]?.type !== "turn.completed") return;
+          // The second turn starts a fresh accumulator, not the first doubled.
+          expect(completed[1].payload.tokenUsage).toEqual({
+            usageScope: "main_agent",
+            usageStatus: "complete",
+            hasSubagents: false,
+            inputTokens: 110,
+            outputTokens: 10,
+            cachedInputTokens: 5,
+            cacheCreationTokens: 5,
+          });
+        }),
+    ),
+  );
+
+  it.effect("marks a failed turn's accumulated usage partial, not complete", () =>
+    runWithFake(
+      {
+        promptEvents: [
+          { type: "agent_start" },
+          textDelta("partial work"),
+          assistantMessageEnd("error", {
+            errorMessage: "boom",
+            usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
+          }),
+          { type: "agent_settled" },
+        ],
+      },
+      ({ adapter, waitUntil, events }) =>
+        Effect.gen(function* () {
+          yield* adapter.sendTurn({ threadId: THREAD_ID, input: "hello" });
+          yield* waitUntil((seen) => completedTurns(seen).length >= 1);
+          const completed = completedTurns(yield* events)[0];
+          expect(completed?.type).toBe("turn.completed");
+          if (completed?.type !== "turn.completed") return;
+          expect(completed.payload.state).toBe("failed");
+          expect(completed.payload.tokenUsage).toEqual({
+            usageScope: "main_agent",
+            usageStatus: "partial",
+            hasSubagents: false,
+            inputTokens: 100,
+            outputTokens: 10,
+          });
+        }),
+    ),
+  );
+
+  it.effect("ignores live message_update usage for the authoritative turn total", () =>
+    runWithFake(
+      {
+        promptEvents: [
+          { type: "agent_start" },
+          messageUpdateWithUsage({
+            input: 999,
+            output: 999,
+            cacheRead: 999,
+            cacheWrite: 999,
+            totalTokens: 3996,
+          }),
+          textDelta("hi"),
+          assistantMessageEnd("stop"),
+          { type: "agent_settled" },
+        ],
+      },
+      ({ adapter, waitUntil, events }) =>
+        Effect.gen(function* () {
+          yield* adapter.sendTurn({ threadId: THREAD_ID, input: "hello" });
+          yield* waitUntil((seen) => completedTurns(seen).length >= 1);
+          const seen = yield* events;
+          // The live thread-level snapshot still fires from message_update...
+          expect(seen.some((event) => event.type === "thread.token-usage.updated")).toBe(true);
+          const completed = completedTurns(seen)[0];
+          expect(completed?.type).toBe("turn.completed");
+          if (completed?.type !== "turn.completed") return;
+          // ...but the authoritative turn total comes only from message_end usage.
+          expect(completed.payload.tokenUsage).toEqual({
+            usageScope: "main_agent",
+            usageStatus: "unavailable",
+            hasSubagents: false,
+          });
+        }),
+    ),
+  );
+
+  it.effect("a synthetic model slug does not overwrite the Pi-native session model", () =>
+    runWithFake(
+      {
+        promptEvents: [
+          { type: "agent_start" },
+          textDelta("reply"),
+          assistantMessageEnd("stop"),
+          { type: "agent_settled" },
+        ],
+      },
+      ({ adapter, waitUntil }) =>
+        Effect.gen(function* () {
+          yield* adapter.sendTurn({
+            threadId: THREAD_ID,
+            input: "hello",
+            modelSelection: { instanceId: TEST_INSTANCE_ID, model: "pi-default" },
+          });
+          yield* waitUntil((seen) => completedTurns(seen).length >= 1);
+          const sessions = yield* adapter.listSessions();
+          expect(sessions.length).toBe(1);
+          // get_state reported provider/id = "test/test-model"; the synthetic
+          // slug must not clobber it.
+          expect(sessions[0]?.model).toBe("test/test-model");
+        }),
+    ),
   );
 });

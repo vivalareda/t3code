@@ -4,6 +4,8 @@ Pi is an early-access provider. Install [Pi](https://github.com/badlogic/pi-mono
 
 Set **Binary path** if `pi` is not on the server's `PATH`. **Pi agent directory** selects a separate Pi configuration, including its credentials, models, and extensions. It is a path on the environment's machine, not the computer displaying T3 Code.
 
+**Pi default** keeps Pi's current model: your profile's default for a new session, or the saved model when resuming. Choose a specific model to override it. Available models appear after a session starts; refresh the provider in Settings to discover them beforehand.
+
 Pi executes tools using its own configuration. Configure approval extensions in Pi if you need permission prompts. Provider-side conversation rewind and Pi-powered automatic title/commit generation are not supported.
 
 ## Background subagents

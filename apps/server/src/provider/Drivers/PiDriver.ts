@@ -16,6 +16,7 @@ import * as Crypto from "effect/Crypto";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
@@ -27,6 +28,7 @@ import {
   checkPiProviderStatus,
   discoverPiModelsViaRpc,
   makePiModelCatalog,
+  mergePiModels,
   type PiModelCatalog,
 } from "../Layers/PiProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
@@ -113,6 +115,25 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         initialSnapshot: (settings) =>
           buildInitialPiProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider,
+        // Live sessions (via the adapter hook) call `modelCatalog.set`; fold
+        // those writes into the managed snapshot immediately so the model
+        // picker reflects a newly discovered catalog without the health timer
+        // or an explicit refresh. This only republishes the current snapshot
+        // with the updated models — it never re-probes — so it cannot collide
+        // with the version/health check or the explicit refresh path.
+        enrichSnapshot: ({ getSnapshot, publishSnapshot }) =>
+          modelCatalog.changes.pipe(
+            Stream.mapEffect((models) =>
+              getSnapshot.pipe(
+                Effect.map((current) => ({
+                  ...current,
+                  models: mergePiModels(models, effectiveConfig.customModels),
+                })),
+                Effect.flatMap(publishSnapshot),
+              ),
+            ),
+            Stream.runDrain,
+          ),
       }).pipe(
         Effect.mapError(
           (cause) =>
