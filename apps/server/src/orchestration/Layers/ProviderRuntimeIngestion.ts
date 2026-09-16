@@ -35,6 +35,10 @@ import { formatTokens } from "@t3tools/shared/usageFormat";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import {
+  ProjectionChildTranscriptRepository,
+  ProjectionChildTranscriptRepositoryLive,
+} from "../../persistence/ProjectionChildTranscripts.ts";
 import { ProjectionThreadActivityRepository } from "../../persistence/Services/ProjectionThreadActivities.ts";
 import { ProjectionThreadActivityRepositoryLive } from "../../persistence/Layers/ProjectionThreadActivities.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
@@ -58,6 +62,43 @@ import { canReplaceThreadTitle } from "../threadTitles.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 const providerTaskKey = (threadId: ThreadId, taskId: string) => `${threadId}:${taskId}`;
+
+type ChildTranscriptStatusValue = "running" | "done" | "error" | "cancelled" | "interrupted";
+
+/**
+ * Map the wire RuntimeTaskStatus vocabulary onto the durable child status.
+ * `completed → done`, `failed → error`, `cancelled → cancelled`,
+ * `interrupted → interrupted`; every non-terminal runtime state collapses to
+ * `running` so an unknown status can never be stored verbatim.
+ */
+const toChildTranscriptStatus = (status: string | undefined): ChildTranscriptStatusValue => {
+  switch (status) {
+    case "completed":
+      return "done";
+    case "failed":
+      return "error";
+    case "cancelled":
+      return "cancelled";
+    case "interrupted":
+      return "interrupted";
+    default:
+      return "running";
+  }
+};
+
+/**
+ * Log a failure writing a durable child row instead of silently dropping it
+ * (silent `.pipe(Effect.ignore)` hid the runId regression). The child branch
+ * must never fail the surrounding turn lifecycle, only record the loss.
+ */
+const logChildRowFailure =
+  (eventId: string, eventType: string, childId: string) => (cause: Cause.Cause<unknown>) =>
+    Effect.logWarning("provider runtime ingestion failed to persist child-agent row", {
+      eventId,
+      eventType,
+      childId,
+      cause: Cause.pretty(cause),
+    });
 
 // Fallback when the in-memory description cache no longer has the task name
 // (server restart, session-exit sweep, TTL/capacity eviction): earlier
@@ -395,6 +436,10 @@ function taskLinkageActivityFields(payload: Record<string, unknown>): Record<str
     "phases",
     "attempt",
     "runHandles",
+    // Canonical process-generation id. Repeated on every bridged child row so
+    // client folds can reconcile ordinary task rows against durable children by
+    // exact (childId, runId); absent on legacy rows and non-bridged providers.
+    "runId",
     "outputFile",
     "agentPath",
     "timelineBypass",
@@ -626,6 +671,13 @@ export function runtimeEventToActivities(
       // under separate stable ids prevents a command/reasoning update from
       // replacing the last known token count (and prevents a usage-only tick
       // from blanking the last meaningful activity).
+      //
+      // Bridged child events stamp the process-generation run id, and the
+      // stable latest-state ids must be generation-aware: a reused `sa-1`
+      // after a restart writes a fresh row instead of overwriting the prior
+      // generation's retained activity. Providers that never stamp runId keep
+      // the legacy (generation-agnostic) id unchanged.
+      const childGeneration = event.payload.runId;
       const identityLinkage = { ...linkage };
       delete identityLinkage.typedUsage;
       delete identityLinkage.status;
@@ -647,7 +699,11 @@ export function runtimeEventToActivities(
                 // Stable per-task id: activity is "latest state", not
                 // history, so each meaningful tick replaces the last. This
                 // bounds a large fleet to one activity row per task.
-                id: EventId.make(`task-progress:${event.threadId}:${event.payload.taskId}`),
+                id: EventId.make(
+                  childGeneration !== undefined
+                    ? `task-progress:${event.threadId}:${event.payload.taskId}:${childGeneration}`
+                    : `task-progress:${event.threadId}:${event.payload.taskId}`,
+                ),
                 createdAt: event.createdAt,
                 tone: "info" as const,
                 kind: "task.progress" as const,
@@ -678,7 +734,11 @@ export function runtimeEventToActivities(
         ...(event.payload.typedUsage !== undefined
           ? [
               {
-                id: EventId.make(`task-usage:${event.threadId}:${event.payload.taskId}`),
+                id: EventId.make(
+                  childGeneration !== undefined
+                    ? `task-usage:${event.threadId}:${event.payload.taskId}:${childGeneration}`
+                    : `task-usage:${event.threadId}:${event.payload.taskId}`,
+                ),
                 createdAt: event.createdAt,
                 tone: "info" as const,
                 kind: "task.progress" as const,
@@ -967,6 +1027,7 @@ const make = Effect.gen(function* () {
   const projectionThreadMessages = yield* ProjectionThreadMessageRepository;
   const projectionThreadProposedPlans = yield* ProjectionThreadProposedPlanRepository;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
+  const projectionChildTranscriptRepository = yield* ProjectionChildTranscriptRepository;
   const projectionThreadActivityRepository = yield* ProjectionThreadActivityRepository;
   const serverSettingsService = yield* ServerSettingsService;
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
@@ -1582,6 +1643,18 @@ const make = Effect.gen(function* () {
     },
   );
 
+  /**
+   * The process-generation run id is stamped on every canonical child task
+   * event by the adapter. Ingestion never invents one: a child event without
+   * a run id is dropped (with a warning) so a reused `sa-1` can never land
+   * under a fabricated generation and collide with history.
+   */
+  const resolveChildRunId = (event: ProviderRuntimeEvent): string | undefined => {
+    const payload = event.payload as { runId?: unknown } | undefined;
+    const runId = payload?.runId;
+    return typeof runId === "string" && runId.trim().length > 0 ? runId : undefined;
+  };
+
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
       if (event.type === "content.delta" && event.payload.streamKind !== "assistant_text") {
@@ -2163,6 +2236,154 @@ const make = Effect.gen(function* () {
           break;
       }
 
+      // Durable child display state (bridged Pi subagents and any future
+      // provider with child agents). Scoped by instance + run so reused
+      // child ids after a restart cannot collide with history. Failures are
+      // logged, never silently dropped, and never break turn state.
+      if (
+        event.type === "task.started" ||
+        event.type === "task.updated" ||
+        event.type === "task.completed" ||
+        event.type === "task.progress" ||
+        event.type === "task.transcript"
+      ) {
+        const payload = event.payload as {
+          taskId: string;
+          status?: string;
+          title?: string;
+          model?: string;
+          effort?: string;
+          error?: string;
+          summary?: string;
+          seq?: number;
+          chunk?: unknown;
+          typedUsage?: { totalTokens?: number };
+          taskType?: string;
+        };
+        if (payload.taskType === "subagent" && event.providerInstanceId !== undefined) {
+          const runId = resolveChildRunId(event);
+          if (runId === undefined) {
+            // Never invent a generation: a child event without a run id is
+            // dropped (and surfaced) instead of landing under a constant.
+            yield* Effect.logWarning("dropping child event without a run id", {
+              eventId: event.eventId,
+              eventType: event.type,
+              taskId: payload.taskId,
+            });
+          } else {
+            const childScope = {
+              threadId: thread.id,
+              instanceId: event.providerInstanceId,
+              runId,
+              childId: payload.taskId,
+            };
+            const logFailure = logChildRowFailure(event.eventId, event.type, payload.taskId);
+            const nowIso = event.createdAt;
+            if (event.type === "task.transcript") {
+              if (typeof payload.seq === "number" && payload.chunk !== undefined) {
+                yield* projectionChildTranscriptRepository
+                  .appendChunk({
+                    ...childScope,
+                    seq: payload.seq,
+                    chunk: payload.chunk,
+                    createdAt: nowIso,
+                  })
+                  .pipe(Effect.catchCause(logFailure));
+              }
+            } else if (event.type === "task.started") {
+              yield* projectionChildTranscriptRepository
+                .upsertState({
+                  ...childScope,
+                  title: payload.title ?? null,
+                  backend: "pi",
+                  cwd: null,
+                  model: payload.model ?? null,
+                  effort: payload.effort ?? null,
+                  status: "running",
+                  outcomeStatus: null,
+                  summary: null,
+                  errorText: null,
+                  tokens: null,
+                  contextWindow: null,
+                  startedAt: nowIso,
+                  settledAt: null,
+                  updatedAt: nowIso,
+                })
+                .pipe(Effect.catchCause(logFailure));
+            } else if (event.type === "task.updated") {
+              const updatedStatus = toChildTranscriptStatus(payload.status);
+              const terminal = updatedStatus !== "running";
+              yield* projectionChildTranscriptRepository
+                .upsertState({
+                  ...childScope,
+                  title: payload.title ?? null,
+                  backend: null,
+                  cwd: null,
+                  model: payload.model ?? null,
+                  effort: payload.effort ?? null,
+                  status: updatedStatus,
+                  outcomeStatus: terminal ? updatedStatus : null,
+                  summary: null,
+                  errorText: payload.error ?? null,
+                  tokens: null,
+                  contextWindow: null,
+                  startedAt: null,
+                  settledAt: terminal ? nowIso : null,
+                  updatedAt: nowIso,
+                })
+                .pipe(Effect.catchCause(logFailure));
+            } else if (event.type === "task.progress") {
+              const totalTokens = payload.typedUsage?.totalTokens;
+              yield* projectionChildTranscriptRepository
+                .upsertState({
+                  ...childScope,
+                  title: null,
+                  backend: null,
+                  cwd: null,
+                  model: null,
+                  effort: null,
+                  status: "running",
+                  outcomeStatus: null,
+                  summary: null,
+                  errorText: null,
+                  tokens: typeof totalTokens === "number" ? totalTokens : null,
+                  contextWindow: null,
+                  startedAt: null,
+                  settledAt: null,
+                  updatedAt: nowIso,
+                })
+                .pipe(Effect.catchCause(logFailure));
+            } else {
+              // task.completed is terminal and idempotent.
+              yield* projectionChildTranscriptRepository
+                .upsertState({
+                  ...childScope,
+                  title: null,
+                  backend: null,
+                  cwd: null,
+                  model: null,
+                  effort: null,
+                  status:
+                    payload.status === "completed"
+                      ? "done"
+                      : payload.status === "stopped"
+                        ? "cancelled"
+                        : "error",
+                  outcomeStatus: payload.status ?? null,
+                  summary: payload.summary ?? null,
+                  errorText: payload.error ?? null,
+                  tokens: null,
+                  contextWindow: null,
+                  startedAt: null,
+                  settledAt: nowIso,
+                  updatedAt: nowIso,
+                })
+                .pipe(Effect.catchCause(logFailure));
+            }
+          }
+        }
+      }
+
       let taskTitle: string | undefined;
       if (event.type === "task.completed") {
         taskTitle = yield* lookupTaskDescription(thread.id, event.payload.taskId);
@@ -2304,4 +2525,5 @@ export const ProviderRuntimeIngestionLive = Layer.effect(
   Layer.provide(ProjectionThreadMessageRepositoryLive),
   Layer.provide(ProjectionThreadProposedPlanRepositoryLive),
   Layer.provide(ProjectionTurnRepositoryLive),
+  Layer.provide(ProjectionChildTranscriptRepositoryLive),
 );

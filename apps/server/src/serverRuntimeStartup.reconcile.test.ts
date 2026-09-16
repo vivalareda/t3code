@@ -18,6 +18,7 @@ import * as Stream from "effect/Stream";
 import { OrchestrationCommandInvariantError } from "./orchestration/Errors.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProjectionChildTranscriptRepository } from "./persistence/ProjectionChildTranscripts.ts";
 import {
   ProviderSessionDirectoryPersistenceError,
   ProviderSessionNotFoundError,
@@ -78,6 +79,19 @@ const queryWithThreads = (threads: ReadonlyArray<ReturnType<typeof makeThread>>)
     getCommandReadModel: () => Effect.succeed({ threads } as never),
   }) as unknown as ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"];
 
+/** Every startup sweep runs `markAllUnfinishedInterrupted`; other repository
+ * methods are not exercised by reconciliation and intentionally die. */
+const noopChildTranscriptRepository = {
+  appendChunk: () => Effect.die("unused"),
+  upsertState: () => Effect.die("unused"),
+  getState: () => Effect.die("unused"),
+  listChunks: () => Effect.die("unused"),
+  listStates: () => Effect.die("unused"),
+  markUnfinishedInterrupted: () => Effect.die("unused"),
+  markAllUnfinishedInterrupted: () => Effect.void,
+  deleteByThreadId: () => Effect.die("unused"),
+} as unknown as ProjectionChildTranscriptRepository["Service"];
+
 const runReconciliation = (input: {
   readonly threads: ReadonlyArray<ReturnType<typeof makeThread>>;
   readonly continueAfterRestart?: boolean;
@@ -85,6 +99,7 @@ const runReconciliation = (input: {
   readonly providerService?: ProviderService.ProviderService["Service"];
   readonly directory: ProviderSessionDirectory.ProviderSessionDirectory["Service"];
   readonly dispatch: OrchestrationEngine.OrchestrationEngineService["Service"]["dispatch"];
+  readonly childTranscriptRepository?: ProjectionChildTranscriptRepository["Service"];
 }) =>
   ServerRuntimeStartup.reconcileProviderSessions.pipe(
     Effect.provideService(
@@ -96,6 +111,10 @@ const runReconciliation = (input: {
       input.providerService ?? makeProviderService(input.liveThreadIds),
     ),
     Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, input.directory),
+    Effect.provideService(
+      ProjectionChildTranscriptRepository,
+      input.childTranscriptRepository ?? noopChildTranscriptRepository,
+    ),
     Effect.provideService(OrchestrationEngine.OrchestrationEngineService, {
       readEvents: () => Stream.empty,
       readThreadEvents: () => Stream.empty,
@@ -114,6 +133,32 @@ const runReconciliation = (input: {
       ),
     ),
   );
+
+it.effect("sweeps unfinished durable children at startup reconciliation", () =>
+  Effect.gen(function* () {
+    const swept = yield* Deferred.make<void>();
+    const childTranscriptRepository = {
+      ...noopChildTranscriptRepository,
+      markAllUnfinishedInterrupted: () => Deferred.succeed(swept, undefined).pipe(Effect.asVoid),
+    } as unknown as ProjectionChildTranscriptRepository["Service"];
+
+    yield* runReconciliation({
+      threads: [],
+      directory: {
+        getBinding: () => Effect.succeed(Option.none()),
+        upsert: () => Effect.void,
+        recordImportedTranscript: () => Effect.die("unused"),
+        getProvider: () => Effect.die("unused"),
+        listThreadIds: () => Effect.die("unused"),
+        listBindings: () => Effect.succeed([]),
+      },
+      dispatch: () => Effect.succeed({ sequence: 0 }),
+      childTranscriptRepository,
+    });
+
+    yield* Deferred.await(swept);
+  }),
+);
 
 it.effect("marks active running sessions that have persisted resume state", () => {
   const active = makeThread("thread-mark-active", "running", TurnId.make("turn-mark-active"));
@@ -723,6 +768,7 @@ it.effect("does not fail startup when the live provider session inventory cannot
       subscribeDomainEvents: Effect.succeed(Stream.empty),
       latestSequence: Effect.succeed(0),
     }),
+    Effect.provideService(ProjectionChildTranscriptRepository, noopChildTranscriptRepository),
     Effect.provide(Layer.mergeAll(NodeServices.layer, ServerSettings.layerTest())),
     Effect.tap(() => Effect.sync(() => assert.equal(queried, false))),
   );

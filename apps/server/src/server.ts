@@ -39,6 +39,8 @@ import { pullRequestHttpApiLayer } from "./pullRequest/http.ts";
 import * as PullRequestProviderRegistry from "./pullRequest/PullRequestProviderRegistry.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
+import { ProjectionChildTranscriptRepositoryLive } from "./persistence/ProjectionChildTranscripts.ts";
+import { layer as ChildAgentChangeHubLayer } from "./provider/Services/ChildAgentChangeHub.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
@@ -268,7 +270,16 @@ const ProviderLayerLive = ProviderServiceLive.pipe(
   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
 );
 
-const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
+// Child-agent persistence and its change hub are provided once at the top
+// level so startup reconciliation, runtime ingestion, and child control all
+// share the same repository and notification stream. `provideMerge` (not
+// `mergeAll`) establishes the provider→consumer edge: the repository consumes
+// the shared hub and sqlite, and all three services stay exposed for the rest
+// of the graph.
+const PersistenceLayerLive = ProjectionChildTranscriptRepositoryLive.pipe(
+  Layer.provideMerge(ChildAgentChangeHubLayer),
+  Layer.provideMerge(SqlitePersistenceLayerLive),
+);
 
 const VcsDriverRegistryLayerLive = VcsDriverRegistry.layer.pipe(
   Layer.provide(VcsProjectConfig.layer),

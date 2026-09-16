@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vite-plus/test";
-import { classifyTaskAgentKind, type OrchestrationThreadActivity } from "@t3tools/contracts";
+import {
+  classifyTaskAgentKind,
+  type ChildAgentState,
+  type OrchestrationThreadActivity,
+} from "@t3tools/contracts";
 import {
   deriveAgentPanelModel,
   foldSubagentActivities,
   formatSubagentModelLabel,
   formatSubagentTokenCount,
 } from "./subagentRuntime.ts";
+import { mergeProviderChildren } from "./childAgents.ts";
 
 let sequence = 0;
 /**
@@ -59,6 +64,32 @@ function legacyActivity(
 
 function fold(rows: ReadonlyArray<OrchestrationThreadActivity>) {
   return foldSubagentActivities(rows);
+}
+
+/** A durable projected child row (`projection_child_states`) as the list RPC returns it. */
+function durableChild(fields: {
+  readonly runId: string;
+  readonly childId: string;
+  readonly status: "running" | "done" | "error" | "cancelled" | "interrupted";
+  readonly tokens?: number | null;
+  readonly title?: string | null;
+}): ChildAgentState {
+  return {
+    threadId: "thread-a",
+    instanceId: "pi",
+    runId: fields.runId,
+    childId: fields.childId,
+    title: fields.title ?? null,
+    backend: null,
+    model: null,
+    effort: null,
+    status: fields.status,
+    summary: null,
+    errorText: null,
+    tokens: fields.tokens ?? null,
+    startedAt: null,
+    settledAt: null,
+  } as unknown as ChildAgentState;
 }
 
 describe("foldSubagentActivities", () => {
@@ -370,6 +401,19 @@ describe("foldSubagentActivities", () => {
     ]);
     expect(agents[0]!.runHandles?.sessionUrl).toBeUndefined();
     expect(agents[0]!.runHandles?.runId).toBe("run-1");
+  });
+
+  it("retains the canonical child generation runId from the task payload", () => {
+    const agents = fold([
+      activity("task.started", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        runId: "run-2", // top-level process-generation id, not runHandles.runId
+      }),
+    ]);
+    expect(agents[0]!.childRunId).toBe("run-2");
+    // The nested Codex run handle remains a distinct concept.
+    expect(agents[0]!.runHandles?.runId).toBeUndefined();
   });
 });
 
@@ -889,5 +933,138 @@ describe("nested agents vs subagent shells", () => {
       }),
     ]);
     expect(agents.map((agent) => agent.id)).toEqual(["nested-1"]);
+  });
+});
+
+describe("assembled Pi child roster (persisted shapes → fold → merge)", () => {
+  // These payloads are the exact post-ingestion task.* activity shapes the
+  // server persists (see ProviderRuntimeIngestion.taskLinkageActivityFields):
+  // `runId` is the canonical process-generation id carried on every bridged
+  // child row. The server-side persistence regression proves runId reaches
+  // SQLite; this regression proves the shared fold + merge consumes those
+  // actual shapes without double-rendering a child.
+  it("two concurrent children reunite to exactly two rows, not four", () => {
+    const runId = "run-1";
+    const activities = [
+      activity("task.started", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        title: "Explorer Alpha",
+        detail: "Explorer Alpha",
+        runId,
+      }),
+      activity("task.updated", { taskId: "sa-1", taskType: "subagent", status: "running", runId }),
+      activity("task.progress", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        title: "child activity",
+        detail: "child activity",
+        typedUsage: { totalTokens: 1200 },
+        runId,
+      }),
+      activity("task.started", {
+        taskId: "sa-2",
+        taskType: "subagent",
+        title: "Explorer Beta",
+        detail: "Explorer Beta",
+        runId,
+      }),
+      activity("task.updated", { taskId: "sa-2", taskType: "subagent", status: "running", runId }),
+      activity("task.progress", {
+        taskId: "sa-2",
+        taskType: "subagent",
+        title: "child activity",
+        detail: "child activity",
+        typedUsage: { totalTokens: 800 },
+        runId,
+      }),
+      activity("task.updated", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        status: "cancelled",
+        error: "Run was aborted",
+        runId,
+      }),
+      activity("task.completed", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        status: "stopped",
+        error: "Run was aborted",
+        runId,
+      }),
+    ];
+
+    const panel = deriveAgentPanelModel({ agents: fold(activities) });
+    const merged = mergeProviderChildren(panel, [
+      durableChild({ runId, childId: "sa-1", status: "cancelled", tokens: 1200 }),
+      durableChild({ runId, childId: "sa-2", status: "running", tokens: 800 }),
+    ]);
+
+    expect(merged.directAgents).toHaveLength(0);
+    expect(merged.providerChildren.map((child) => child.childId)).toEqual(["sa-1", "sa-2"]);
+    expect(merged.runningCount).toBe(1);
+    expect(merged.settledCount).toBe(1);
+    expect(merged.liveCount).toBe(1);
+    expect(merged.totalTokens).toBe(2000);
+    expect(merged.hasAgents).toBe(true);
+  });
+
+  it("a reused sa-1 across generations keeps both durable children and no activity twin", () => {
+    const run1 = "run-1";
+    const run2 = "run-2";
+    const activities = [
+      activity("task.started", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        title: "Old child",
+        runId: run1,
+      }),
+      activity("task.progress", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        typedUsage: { totalTokens: 100 },
+        runId: run1,
+      }),
+      activity("task.updated", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        status: "cancelled",
+        runId: run1,
+      }),
+      activity("task.completed", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        status: "stopped",
+        runId: run1,
+      }),
+      activity("task.started", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        title: "New child",
+        runId: run2,
+      }),
+      activity("task.updated", {
+        taskId: "sa-1",
+        taskType: "subagent",
+        status: "running",
+        runId: run2,
+      }),
+    ];
+
+    const panel = deriveAgentPanelModel({ agents: fold(activities) });
+    const merged = mergeProviderChildren(panel, [
+      durableChild({ runId: run1, childId: "sa-1", status: "cancelled", tokens: 100 }),
+      durableChild({ runId: run2, childId: "sa-1", status: "running", tokens: 0 }),
+    ]);
+
+    expect(merged.directAgents).toHaveLength(0);
+    expect(merged.providerChildren.map((child) => `${child.childId}/${child.runId}`)).toEqual([
+      "sa-1/run-1",
+      "sa-1/run-2",
+    ]);
+    expect(merged.runningCount).toBe(1);
+    expect(merged.settledCount).toBe(1);
+    expect(merged.liveCount).toBe(1);
+    expect(merged.totalTokens).toBe(100);
   });
 });

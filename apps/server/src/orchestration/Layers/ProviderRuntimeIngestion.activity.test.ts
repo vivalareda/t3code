@@ -82,6 +82,92 @@ describe("runtimeEventToActivities task progress", () => {
     expect(usagePayload).not.toHaveProperty("status");
   });
 });
+describe("runtimeEventToActivities canonical child generation", () => {
+  it("persists runId on every task lifecycle activity payload", () => {
+    const taskId = RuntimeTaskId.make("sa-1");
+    const runId = "run-gen-42";
+    const started = runtimeEventToActivities({
+      ...base,
+      type: "task.started",
+      eventId: EventId.make("evt-started"),
+      payload: { taskId, taskType: "subagent", description: "Explore", runId },
+    } satisfies ProviderRuntimeEvent);
+    const updated = runtimeEventToActivities({
+      ...base,
+      type: "task.updated",
+      eventId: EventId.make("evt-updated"),
+      payload: { taskId, taskType: "subagent", status: "running", runId },
+    } satisfies ProviderRuntimeEvent);
+    const completed = runtimeEventToActivities({
+      ...base,
+      type: "task.completed",
+      eventId: EventId.make("evt-completed"),
+      payload: { taskId, taskType: "subagent", status: "completed", runId },
+    } satisfies ProviderRuntimeEvent);
+
+    const startedPayload = started[0]?.payload as Record<string, unknown> | undefined;
+    const updatedPayload = updated[0]?.payload as Record<string, unknown> | undefined;
+    const completedPayload = completed[0]?.payload as Record<string, unknown> | undefined;
+    expect(startedPayload?.runId).toBe(runId);
+    expect(updatedPayload?.runId).toBe(runId);
+    expect(completedPayload?.runId).toBe(runId);
+  });
+
+  it("scopes task.progress/task-usage stable ids by generation, and keeps legacy ids when unstamped", () => {
+    const taskId = RuntimeTaskId.make("sa-1");
+    const first = runtimeEventToActivities({
+      ...base,
+      type: "task.progress",
+      eventId: EventId.make("evt-progress-a"),
+      payload: {
+        taskId,
+        description: "Explore",
+        summary: "Working",
+        typedUsage: { totalTokens: 10 },
+        runId: "run-a",
+      },
+    } satisfies ProviderRuntimeEvent);
+    const second = runtimeEventToActivities({
+      ...base,
+      type: "task.progress",
+      eventId: EventId.make("evt-progress-b"),
+      payload: {
+        taskId,
+        description: "Explore",
+        summary: "Working",
+        typedUsage: { totalTokens: 20 },
+        runId: "run-b",
+      },
+    } satisfies ProviderRuntimeEvent);
+    const legacy = runtimeEventToActivities({
+      ...base,
+      type: "task.progress",
+      eventId: EventId.make("evt-progress-legacy"),
+      payload: {
+        taskId,
+        description: "Explore",
+        summary: "Working",
+        typedUsage: { totalTokens: 30 },
+      },
+    } satisfies ProviderRuntimeEvent);
+
+    expect(first.map((activity) => activity.id)).toEqual([
+      "task-progress:thread-1:sa-1:run-a",
+      "task-usage:thread-1:sa-1:run-a",
+    ]);
+    expect(second.map((activity) => activity.id)).toEqual([
+      "task-progress:thread-1:sa-1:run-b",
+      "task-usage:thread-1:sa-1:run-b",
+    ]);
+    expect(legacy.map((activity) => activity.id)).toEqual([
+      "task-progress:thread-1:sa-1",
+      "task-usage:thread-1:sa-1",
+    ]);
+    const firstPayload = first[0]?.payload as Record<string, unknown> | undefined;
+    expect(firstPayload?.runId).toBe("run-a");
+  });
+});
+
 describe("runtimeEventToActivities tool streaming persistence", () => {
   const accumulatedStdout = [
     "first line of output",

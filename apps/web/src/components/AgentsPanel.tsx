@@ -9,6 +9,13 @@
  * - Workflow expansion is presentation state. A live run stays expanded when
  *   it settles; older collapsed runs can still be opened at run granularity.
  * - Static status dots, DOM-write elapsed timers, plain token counters.
+ *
+ * Provider children (Pi subagents) are loaded by the shared `useChildAgentRoster`
+ * hook (which owns `childAgent.list` + `childAgent.subscribeChanges`) and merged
+ * into the same view model so the roster, counts, and the ChatView activity
+ * indicator agree. Selection stores the full identity and derives the live child
+ * from the current roster, and resets synchronously when the thread or
+ * environment changes.
  */
 import { useAtomValue } from "@effect/atom-react";
 import type {
@@ -20,14 +27,21 @@ import {
   formatSubagentModelLabel,
   formatSubagentTokenCount,
 } from "@t3tools/client-runtime/state/subagentRuntime";
-import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { Bot, Braces, Check, ChevronDown, ChevronRight, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import {
+  childAgentIdentityKey,
+  childAgentIdentityOf,
+  mergeProviderChildren,
+  type ChildAgentIdentity,
+} from "@t3tools/client-runtime/state/childAgents";
+import type { ChildAgentState, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { Bot, Braces, Check, ChevronDown, ChevronRight, Loader2, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Button } from "~/components/ui/button";
+import { ChildAgentTranscriptView } from "~/components/ChildAgentTranscriptView";
 
 /**
  * In-flight states all present as Working (one steady state, per the
@@ -521,24 +535,149 @@ function WorkflowSection({
   );
 }
 
+/**
+ * One provider-owned child (Pi subagent). Rows mirror the native agent row
+ * shape; opening one shows its read-only transcript with an individual
+ * Cancel control.
+ */
+function ProviderChildRow({ child, onOpen }: { child: ChildAgentState; onOpen: () => void }) {
+  const live = child.status === "running";
+  const dotClass =
+    child.status === "running"
+      ? "bg-info"
+      : child.status === "done"
+        ? "bg-success"
+        : child.status === "error"
+          ? "bg-destructive"
+          : "bg-muted-foreground/60";
+  const statusLabel =
+    child.status === "running"
+      ? "Working"
+      : child.status === "done"
+        ? "Completed"
+        : child.status === "error"
+          ? "Failed"
+          : "Stopped";
+  const detail = child.errorText ?? child.summary ?? null;
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="grid h-[3.875rem] w-full grid-cols-[0.375rem_minmax(0,1fr)_auto] grid-rows-[1.25rem_1.125rem_1rem] items-center gap-x-2 rounded-md px-1.5 py-1 text-left hover:bg-muted/40"
+    >
+      <span className="col-start-1 row-start-1 flex items-center">
+        <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", dotClass)} />
+      </span>
+      <span className="col-start-2 row-start-1 flex min-w-0 items-baseline gap-2">
+        <span className="min-w-0 truncate text-sm font-medium">{child.title ?? child.childId}</span>
+      </span>
+      <span className="col-start-3 row-start-1 font-mono text-[.7rem] text-muted-foreground/80">
+        {statusLabel}
+      </span>
+      <span
+        className={cn(
+          "col-start-2 col-end-4 row-start-2 block truncate text-xs",
+          child.status === "error" ? "text-destructive-foreground" : "text-muted-foreground",
+        )}
+      >
+        {detail ?? statusLabel}
+      </span>
+      <span className="col-start-2 col-end-4 row-start-3 truncate font-mono text-[.7rem] tabular-nums text-muted-foreground/70">
+        {[child.backend, child.model].filter((value) => value !== null).join(" · ") ||
+          "provider child"}
+      </span>
+      <span className="sr-only">{statusLabel}</span>
+      {live ? <span className="sr-only">Running</span> : null}
+    </button>
+  );
+}
+
 export function AgentsPanel({
   model,
+  providerChildren,
+  providerChildrenError = null,
+  providerChildrenLoading = false,
+  onRefreshProviderChildren,
   environmentId = null,
   threadId = null,
 }: {
   model: AgentPanelModel;
+  providerChildren: ReadonlyArray<ChildAgentState>;
+  providerChildrenError?: string | null;
+  providerChildrenLoading?: boolean;
+  onRefreshProviderChildren: () => void;
   environmentId?: EnvironmentId | null;
   threadId?: ThreadId | null;
 }) {
-  if (!model.hasAgents) {
+  const [selection, setSelection] = useState<{
+    readonly scope: string;
+    readonly identity: ChildAgentIdentity;
+  } | null>(null);
+
+  const canLoad = environmentId !== null && threadId !== null;
+  const scope = canLoad ? `${environmentId}:${threadId}` : null;
+
+  // Only a selection owned by the current scope is live. Deriving against
+  // scope resets the open transcript in the same commit a thread/environment
+  // change renders, without a render-time setState.
+  const activeIdentity =
+    selection !== null && selection.scope === scope ? selection.identity : null;
+
+  const merged = useMemo(
+    () => mergeProviderChildren(model, providerChildren),
+    [model, providerChildren],
+  );
+
+  // Derive the live child from the current roster by full identity.
+  const selectedChild =
+    activeIdentity === null
+      ? null
+      : (providerChildren.find(
+          (child) =>
+            childAgentIdentityKey(childAgentIdentityOf(child)) ===
+            childAgentIdentityKey(activeIdentity),
+        ) ?? null);
+
+  if (activeIdentity !== null && canLoad) {
+    return (
+      <ChildAgentTranscriptView
+        key={`${scope}:${childAgentIdentityKey(activeIdentity)}`}
+        environmentId={environmentId}
+        identity={activeIdentity}
+        child={selectedChild}
+        onBack={() => setSelection(null)}
+      />
+    );
+  }
+
+  if (!merged.hasAgents) {
+    const loading = providerChildrenLoading && providerChildrenError === null;
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
         <Bot aria-hidden className="size-6 text-muted-foreground/60" />
-        <p className="text-sm font-medium">No agents yet</p>
-        <p className="max-w-56 text-xs text-muted-foreground">
-          When this thread spawns subagents or runs a workflow, they show up here with live status,
-          activity, and token usage.
-        </p>
+        {loading ? (
+          <p className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+            <Loader2 aria-hidden className="size-3.5 animate-none" />
+            Loading agents…
+          </p>
+        ) : providerChildrenError !== null ? (
+          <>
+            <p className="text-sm font-medium text-destructive-foreground">
+              {providerChildrenError}
+            </p>
+            <Button size="sm" variant="ghost" onClick={onRefreshProviderChildren}>
+              Retry
+            </Button>
+          </>
+        ) : (
+          <>
+            <p className="text-sm font-medium">No agents yet</p>
+            <p className="max-w-56 text-xs text-muted-foreground">
+              When this thread spawns subagents or runs a workflow, they show up here with live
+              status, activity, and token usage.
+            </p>
+          </>
+        )}
       </div>
     );
   }
@@ -547,7 +686,7 @@ export function AgentsPanel({
     <div className="flex h-full min-h-0 flex-col">
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-2 p-2">
-          {model.workflows.map((group) => (
+          {merged.workflows.map((group) => (
             <WorkflowSection
               key={group.workflow.id}
               group={group}
@@ -555,29 +694,60 @@ export function AgentsPanel({
               threadId={threadId}
             />
           ))}
-          {model.directAgents.length > 0 ? (
+          {merged.directAgents.length > 0 ? (
             <section>
               <div className="px-1.5 pt-1 text-[.65rem] font-medium uppercase tracking-wider text-muted-foreground">
                 Direct spawns
               </div>
-              {model.directAgents.map((agent) => (
+              {merged.directAgents.map((agent) => (
                 <AgentRow key={agent.id} agent={agent} />
               ))}
             </section>
+          ) : null}
+          {merged.providerChildren.length > 0 ? (
+            <section>
+              <div className="px-1.5 pt-1 text-[.65rem] font-medium uppercase tracking-wider text-muted-foreground">
+                Provider children
+              </div>
+              {merged.providerChildren.map((child) => (
+                <ProviderChildRow
+                  key={childAgentIdentityKey(childAgentIdentityOf(child))}
+                  child={child}
+                  onOpen={() => {
+                    if (scope !== null) {
+                      setSelection({ scope, identity: childAgentIdentityOf(child) });
+                    }
+                  }}
+                />
+              ))}
+            </section>
+          ) : null}
+          {providerChildrenError !== null && merged.providerChildren.length === 0 ? (
+            <div className="flex items-center gap-2 px-1.5 pt-1 text-xs text-destructive-foreground">
+              <span className="min-w-0 flex-1 truncate">{providerChildrenError}</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2"
+                onClick={onRefreshProviderChildren}
+              >
+                Retry
+              </Button>
+            </div>
           ) : null}
         </div>
       </ScrollArea>
       <footer className="flex items-center justify-between border-t border-border/60 px-3 py-1.5 font-mono text-[.7rem] text-muted-foreground">
         <span className="flex items-center gap-2">
-          {model.runningCount + model.waitingCount > 0 ? (
+          {merged.runningCount + merged.waitingCount > 0 ? (
             <span className="text-info-foreground">
-              ● {model.runningCount + model.waitingCount} working
+              ● {merged.runningCount + merged.waitingCount} working
             </span>
           ) : null}
-          {model.idleCount > 0 ? <span>{model.idleCount} idle</span> : null}
-          {model.settledCount > 0 ? <span>{model.settledCount} settled</span> : null}
+          {merged.idleCount > 0 ? <span>{merged.idleCount} idle</span> : null}
+          {merged.settledCount > 0 ? <span>{merged.settledCount} settled</span> : null}
         </span>
-        <span className="tabular-nums">Σ {formatSubagentTokenCount(model.totalTokens)} tok</span>
+        <span className="tabular-nums">Σ {formatSubagentTokenCount(merged.totalTokens)} tok</span>
       </footer>
     </div>
   );

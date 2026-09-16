@@ -134,6 +134,7 @@ import { linkCreatedPullRequest } from "./git/linkCreatedPullRequest.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
+import { ChildAgentControl, ChildAgentControlLive } from "./provider/Services/ChildAgentControl.ts";
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
 import { importRecentAgentThreads } from "./project/AgentSessionImporter.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
@@ -605,6 +606,7 @@ const makeWsRpcLayer = (
       });
       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
       const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+      const childAgentControl = yield* ChildAgentControl;
       const agentSessionScanner = yield* AgentSessionScanner.AgentSessionScanner;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
@@ -2909,6 +2911,40 @@ const makeWsRpcLayer = (
               .pipe(Effect.map((cancelled) => ({ cancelled }))),
             { "rpc.aggregate": "vcs" },
           ),
+        [WS_METHODS.childAgentList]: (input) =>
+          observeRpcEffect(WS_METHODS.childAgentList, childAgentControl.list(input), {
+            "rpc.aggregate": "providers",
+          }),
+        [WS_METHODS.childAgentTranscript]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.childAgentTranscript,
+            childAgentControl.transcript({
+              threadId: input.threadId,
+              instanceId: input.instanceId,
+              runId: input.runId,
+              childId: input.childId,
+              afterSeq: input.afterSeq ?? undefined,
+              limit: input.limit ?? undefined,
+            }),
+            { "rpc.aggregate": "providers" },
+          ),
+        [WS_METHODS.childAgentCancel]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.childAgentCancel,
+            childAgentControl.cancel({
+              threadId: input.threadId,
+              instanceId: input.instanceId,
+              runId: input.runId,
+              childId: input.childId,
+            }),
+            { "rpc.aggregate": "providers" },
+          ),
+        [WS_METHODS.childAgentSubscribeChanges]: (input) =>
+          observeRpcStream(
+            WS_METHODS.childAgentSubscribeChanges,
+            childAgentControl.subscribeChanges({ threadId: input.threadId }),
+            { "rpc.aggregate": "providers" },
+          ),
         [WS_METHODS.vcsRefreshStatus]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsRefreshStatus,
@@ -3467,6 +3503,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provide(AgentSessionScanner.layer),
               Layer.provide(ProviderMaintenanceRunner.layer),
+              Layer.provide(ChildAgentControlLive),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),
               // One server-lifetime service means clients share the same PR caches, and a WS
               // mutation invalidates the HTTP diff cache that every client reads from.

@@ -17,6 +17,7 @@ import * as Console from "effect/Console";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import { ProjectionChildTranscriptRepository } from "./persistence/ProjectionChildTranscripts.ts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -538,6 +539,22 @@ export const reconcileProviderSessions = Effect.gen(function* () {
         (thread.session.status === "ready" && preparedThreadIds.has(thread.id))) &&
       !liveThreadIds.has(thread.id),
   );
+
+  // Child-agent reconciliation: a server restart ends every owned child.
+  // Interrupt all still-running durable rows regardless of whether a live
+  // provider binding happens to exist; completed and already-interrupted
+  // rows are preserved. Runs before any new child can be admitted, so no
+  // active row is ever swept. The repository is an explicit dependency so
+  // this sweep is never silently skipped when a layer is missing.
+  const childTranscripts = yield* ProjectionChildTranscriptRepository;
+  const childReconciledAt = DateTime.formatIso(yield* DateTime.now);
+  yield* childTranscripts
+    .markAllUnfinishedInterrupted({ updatedAt: childReconciledAt })
+    .pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("failed to reconcile child agents at startup", { cause }),
+      ),
+    );
 
   for (const thread of orphanedThreads) {
     const session = thread.session;
