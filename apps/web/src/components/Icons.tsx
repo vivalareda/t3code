@@ -781,3 +781,27 @@ export const ForgejoIcon: Icon = (props) => (
     </g>
   </svg>
 );
+
+export const PiIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    className={className}
+    viewBox="0 0 32 32"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
+  >
+    <rect width="32" height="32" rx="7" className="fill-neutral-800 dark:fill-neutral-200" />
+    <text
+      x="16"
+      y="22.5"
+      textAnchor="middle"
+      fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+      fontSize="16"
+      fontWeight="600"
+      className="fill-neutral-100 dark:fill-neutral-900"
+    >
+      π
+    </text>
+  </svg>
+);

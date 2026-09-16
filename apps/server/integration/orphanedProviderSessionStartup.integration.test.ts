@@ -32,6 +32,8 @@ import * as OrchestrationEngine from "../src/orchestration/Services/Orchestratio
 import * as OrchestrationReactor from "../src/orchestration/Services/OrchestrationReactor.ts";
 import * as ProjectionSnapshotQuery from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
 import { makeSqlitePersistenceLive } from "../src/persistence/Layers/Sqlite.ts";
+import { ProjectionChildTranscriptRepositoryLive } from "../src/persistence/ProjectionChildTranscripts.ts";
+import { layer as ChildAgentChangeHubLayer } from "../src/provider/Services/ChildAgentChangeHub.ts";
 import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRuntime.ts";
 import * as ExternalLauncher from "../src/process/externalLauncher.ts";
 import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSessionDirectory.ts";
@@ -65,7 +67,11 @@ const makePersistedRuntimeLayer = (dbPath: string) => {
     Layer.provide(ProviderSessionRuntime.layer),
     Layer.provide(persistence),
   );
-  return Layer.mergeAll(orchestration, directory);
+  const childTranscripts = ProjectionChildTranscriptRepositoryLive.pipe(
+    Layer.provideMerge(ChildAgentChangeHubLayer),
+    Layer.provideMerge(persistence),
+  );
+  return Layer.mergeAll(orchestration, directory, childTranscripts);
 };
 
 const startupDependencies = Layer.mergeAll(

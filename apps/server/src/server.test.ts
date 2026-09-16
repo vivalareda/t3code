@@ -141,6 +141,8 @@ import {
 } from "./provider/AntigravityInstallation.ts";
 import type { ProviderInstance } from "./provider/ProviderDriver.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
+import { ChildAgentChangeHub } from "./provider/Services/ChildAgentChangeHub.ts";
+import { ProjectionChildTranscriptRepository } from "./persistence/ProjectionChildTranscripts.ts";
 import { ProviderAdapterRequestError } from "./provider/Errors.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/providerMaintenance.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -815,6 +817,11 @@ const buildAppUnderTest = (options?: {
             listBindings: () => Effect.succeed([]),
             ...options?.layers?.providerSessionDirectory,
           }),
+          Layer.mock(ChildAgentChangeHub)({
+            publishChanged: () => Effect.void,
+            subscribe: () => Stream.empty,
+          }),
+          Layer.mock(ProjectionChildTranscriptRepository)({}),
           Layer.mock(DeviceService.DeviceService)({
             state: Effect.succeed(EMPTY_DEVICE_STATE),
             currentReadiness: () => Effect.succeed(null),

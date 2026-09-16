@@ -53,6 +53,19 @@ import {
   WorktreeSetupSubscribeInput,
 } from "./worktreeSetup.ts";
 import {
+  ChildAgentCancelInput,
+  ChildAgentCancelResult,
+  ChildAgentChangeEvent,
+  ChildAgentControlUnavailableError,
+  ChildAgentListInput,
+  ChildAgentListResult,
+  ChildAgentNotFoundError,
+  ChildAgentReadError,
+  ChildAgentSubscribeInput,
+  ChildAgentTranscriptInput,
+  ChildAgentTranscriptPage,
+} from "./childAgents.ts";
+import {
   GitActionProgressEvent,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
@@ -412,6 +425,10 @@ export const WS_METHODS = {
   subscribeVcsStatus: "subscribeVcsStatus",
   subscribeWorktreeSetup: "subscribeWorktreeSetup",
   worktreeSetupCancel: "worktreeSetup.cancel",
+  childAgentList: "childAgent.list",
+  childAgentTranscript: "childAgent.transcript",
+  childAgentCancel: "childAgent.cancel",
+  childAgentSubscribeChanges: "childAgent.subscribeChanges",
   subscribeTerminalEvents: "subscribeTerminalEvents",
   subscribeTerminalMetadata: "subscribeTerminalMetadata",
   subscribePreviewEvents: "subscribePreviewEvents",
@@ -961,6 +978,45 @@ const WsWorktreeSetupCancelRpc = Rpc.make(WS_METHODS.worktreeSetupCancel, {
   error: EnvironmentAuthorizationError,
 });
 
+const WsChildAgentListRpc = Rpc.make(WS_METHODS.childAgentList, {
+  payload: ChildAgentListInput,
+  success: ChildAgentListResult,
+  error: Schema.Union([ChildAgentReadError, EnvironmentAuthorizationError]),
+});
+
+const WsChildAgentTranscriptRpc = Rpc.make(WS_METHODS.childAgentTranscript, {
+  payload: ChildAgentTranscriptInput,
+  success: ChildAgentTranscriptPage,
+  error: Schema.Union([
+    ChildAgentNotFoundError,
+    ChildAgentReadError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+const WsChildAgentCancelRpc = Rpc.make(WS_METHODS.childAgentCancel, {
+  payload: ChildAgentCancelInput,
+  success: ChildAgentCancelResult,
+  error: Schema.Union([
+    ChildAgentNotFoundError,
+    ChildAgentControlUnavailableError,
+    ChildAgentReadError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+/**
+ * Bounded change stream for the Agents surface: a `reset` notice on
+ * subscribe/reconnect followed by small `changed` notices naming one durable
+ * child write. No transcript chunks ride this stream; clients re-read pages.
+ */
+const WsChildAgentSubscribeChangesRpc = Rpc.make(WS_METHODS.childAgentSubscribeChanges, {
+  payload: ChildAgentSubscribeInput,
+  success: ChildAgentChangeEvent,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
 const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
   payload: GitRunStackedActionInput,
   success: GitActionProgressEvent,
@@ -1395,6 +1451,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeVcsStatusRpc,
   WsSubscribeWorktreeSetupRpc,
   WsWorktreeSetupCancelRpc,
+  WsChildAgentListRpc,
+  WsChildAgentTranscriptRpc,
+  WsChildAgentCancelRpc,
+  WsChildAgentSubscribeChangesRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsGitRunStackedActionRpc,

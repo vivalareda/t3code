@@ -1102,6 +1102,29 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,
     }),
+    listChildAgents: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:child-agent:list",
+      tag: WS_METHODS.childAgentList,
+      // Change notices can arrive in bursts; coalesce concurrent list reads
+      // for a thread to the newest request instead of polling or fanning out.
+      concurrency: {
+        mode: "latest",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input]),
+      },
+    }),
+    readChildAgentTranscript: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:child-agent:transcript",
+      tag: WS_METHODS.childAgentTranscript,
+    }),
+    cancelChildAgent: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:child-agent:cancel",
+      tag: WS_METHODS.childAgentCancel,
+    }),
+    childAgentSubscribeChanges: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:child-agent:subscribe-changes",
+      tag: WS_METHODS.childAgentSubscribeChanges,
+      idleTtlMs: 0,
+    }),
     refreshUsageRates: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:refresh-usage-rates",
       tag: WS_METHODS.serverRefreshUsageRates,

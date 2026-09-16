@@ -16,6 +16,7 @@ import {
 import { ProviderInstanceId, ProviderDriverKind } from "./providerInstance.ts";
 import { ProviderUsageLimitsUpdate } from "./providerUsageLimits.ts";
 import { ProviderApprovalOption } from "./orchestration.ts";
+import { ChildTranscriptChunk } from "./childAgents.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
@@ -181,6 +182,7 @@ const ProviderRuntimeEventType = Schema.Literals([
   "task.progress",
   "task.updated",
   "task.completed",
+  "task.transcript",
   "hook.started",
   "hook.progress",
   "hook.completed",
@@ -233,6 +235,7 @@ const TaskStartedType = Schema.Literal("task.started");
 const TaskProgressType = Schema.Literal("task.progress");
 const TaskUpdatedType = Schema.Literal("task.updated");
 const TaskCompletedType = Schema.Literal("task.completed");
+const TaskTranscriptType = Schema.Literal("task.transcript");
 const HookStartedType = Schema.Literal("hook.started");
 const HookProgressType = Schema.Literal("hook.progress");
 const HookCompletedType = Schema.Literal("hook.completed");
@@ -667,6 +670,12 @@ const taskAgentLinkageFields = {
    * belongs in the Agents surface, never the parent timeline.
    */
   timelineBypass: Schema.optional(Schema.Boolean),
+  /**
+   * Process-generation run id carried on canonical child task events. Present
+   * on every bridged child event so a reused child id after a restart cannot
+   * collide with history; other task kinds omit it.
+   */
+  runId: Schema.optional(TrimmedNonEmptyStringSchema),
 } as const;
 
 export const TaskAgentLinkage = Schema.Struct(taskAgentLinkageFields);
@@ -730,6 +739,25 @@ const TaskCompletedPayload = Schema.Struct({
   ...taskAgentLinkageFields,
 });
 export type TaskCompletedPayload = typeof TaskCompletedPayload.Type;
+
+/**
+ * One incremental chunk of a child agent's readable transcript, bridged from
+ * the provider's own subagent runtime. `seq` is per-task and monotonically
+ * increasing so replays and reconnections can dedupe; `chunk` carries
+ * append/finalize/add operations over stable item ids. Bulk child transcripts
+ * stay out of the parent chat payload — this event feeds a dedicated
+ * transcript projection, not the activity stream. `runId` is the process
+ * generation and `taskType` is `subagent`; ingestion keys durable child rows
+ * on both.
+ */
+const TaskTranscriptPayload = Schema.Struct({
+  taskId: RuntimeTaskId,
+  runId: TrimmedNonEmptyStringSchema,
+  taskType: Schema.Literal("subagent"),
+  seq: NonNegativeInt,
+  chunk: ChildTranscriptChunk,
+});
+export type TaskTranscriptPayload = typeof TaskTranscriptPayload.Type;
 
 const HookStartedPayload = Schema.Struct({
   hookId: TrimmedNonEmptyStringSchema,
@@ -1104,6 +1132,13 @@ const ProviderRuntimeTaskCompletedEvent = Schema.Struct({
 });
 export type ProviderRuntimeTaskCompletedEvent = typeof ProviderRuntimeTaskCompletedEvent.Type;
 
+const ProviderRuntimeTaskTranscriptEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: TaskTranscriptType,
+  payload: TaskTranscriptPayload,
+});
+export type ProviderRuntimeTaskTranscriptEvent = typeof ProviderRuntimeTaskTranscriptEvent.Type;
+
 const ProviderRuntimeHookStartedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: HookStartedType,
@@ -1259,6 +1294,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeTaskProgressEvent,
   ProviderRuntimeTaskUpdatedEvent,
   ProviderRuntimeTaskCompletedEvent,
+  ProviderRuntimeTaskTranscriptEvent,
   ProviderRuntimeHookStartedEvent,
   ProviderRuntimeHookProgressEvent,
   ProviderRuntimeHookCompletedEvent,

@@ -46,6 +46,7 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import * as ChildAgentChangeHub from "../../provider/Services/ChildAgentChangeHub.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
@@ -324,6 +325,9 @@ describe("ProviderRuntimeIngestion", () => {
       // engine, and the snapshot query (reader).
       Layer.provideMerge(ThreadBackgroundLiveness.layer),
       Layer.provideMerge(ThreadPlanProgress.layer),
+      // The child projection repository now requires a shared change hub;
+      // provide one so durable child writes publish notices in tests too.
+      Layer.provideMerge(ChildAgentChangeHub.layer),
       Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(makeTestServerSettingsLayer(options?.serverSettings)),
@@ -462,6 +466,79 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+  });
+
+  it("persists a provider-initiated continuation turn, recap, and result receipt", async () => {
+    const harness = await createHarness({
+      serverSettings: { responseStreamingMode: "token" },
+    });
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("continuation-turn");
+    const base = {
+      provider: ProviderDriverKind.make("pi"),
+      threadId,
+      turnId,
+      createdAt: "2026-01-01T00:00:01.000Z",
+    };
+
+    // The exact shape PiAdapter emits for a provider-initiated continuation:
+    // a turn.started while the session is idle, a readable subagent-result
+    // receipt, the recap text, and a terminal turn.completed — with no
+    // user message or pending turn start anywhere.
+    await harness.emitAndDrain([
+      { ...base, type: "turn.started", eventId: asEventId("continuation-started") },
+      {
+        ...base,
+        type: "item.completed",
+        eventId: asEventId("continuation-receipt"),
+        itemId: asItemId("subagent-result:run-generation-1:sa-1"),
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          title: "Subagent sa-1 result",
+          detail: "The subagent found a monorepo.",
+          data: { source: "subagent-result", childId: "sa-1", runId: "run-generation-1" },
+        },
+      },
+      {
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("continuation-recap-delta"),
+        itemId: asItemId("continuation-recap-message"),
+        payload: { streamKind: "assistant_text", delta: "Recap: the subagent found a monorepo." },
+      },
+      {
+        ...base,
+        type: "item.completed",
+        eventId: asEventId("continuation-recap-complete"),
+        itemId: asItemId("continuation-recap-message"),
+        payload: { itemType: "assistant_message", status: "completed" },
+      },
+      {
+        ...base,
+        type: "turn.completed",
+        eventId: asEventId("continuation-completed"),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        payload: { state: "completed", stopReason: "stop" },
+      },
+    ]);
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.latestTurn).toMatchObject({ turnId, state: "completed" });
+    expect(thread?.session).toMatchObject({ status: "ready", activeTurnId: null });
+    const assistantMessages =
+      thread?.messages.filter((message) => message.role === "assistant") ?? [];
+    expect(assistantMessages).toHaveLength(2);
+    for (const message of assistantMessages) {
+      expect(message.role).toBe("assistant");
+      expect(message.turnId).toBe(turnId);
+    }
+    // Both the readable child-result receipt and the parent recap must be
+    // stored, regardless of how the projection orders equal-timestamp rows.
+    expect(assistantMessages.map((message) => message.text).sort()).toEqual([
+      "Recap: the subagent found a monorepo.",
+      "The subagent found a monorepo.",
+    ]);
   });
 
   it.each([

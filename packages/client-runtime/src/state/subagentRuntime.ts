@@ -79,6 +79,14 @@ export interface RuntimeSubagent {
   readonly workflowName: string | null;
   readonly phases: ReadonlyArray<SubagentWorkflowPhase>;
   readonly runHandles: SubagentRunHandles | null;
+  /**
+   * Canonical process-generation run id carried on child task payloads
+   * (`taskAgentLinkageFields.runId`, the Pi bridge's T3CODE_PI_BRIDGE_RUN_ID).
+   * Retained so the roster can reconcile ordinary task rows against durable
+   * provider children by exact {@link ChildAgentState} run identity instead of
+   * a bare child id. Null for legacy rows and non-bridged providers.
+   */
+  readonly childRunId: string | null;
   readonly recentActivity: ReadonlyArray<SubagentActivityEntry>;
   /** First retained observation, used as the roster's stable display order. */
   readonly firstSeenAt: string;
@@ -248,6 +256,7 @@ interface MutableAgent {
   workflowName: string | null;
   phases: ReadonlyArray<SubagentWorkflowPhase>;
   runHandles: SubagentRunHandles | null;
+  childRunId: string | null;
   recentActivity: ReadonlyArray<SubagentActivityEntry>;
   firstSeenAt: string;
   startedAt: string | null;
@@ -305,6 +314,7 @@ function getOrCreate(
     workflowName: asString(payload.workflowName) ?? null,
     phases: [],
     runHandles: null,
+    childRunId: null,
     recentActivity: [],
     firstSeenAt: at,
     startedAt: null,
@@ -392,6 +402,15 @@ function fillMetadata(agent: MutableAgent, payload: Record<string, unknown>): vo
     if (Object.keys(runHandles).length > 0) {
       agent.runHandles = { ...agent.runHandles, ...runHandles };
     }
+  }
+  // Canonical child generation identity: the top-level `runId` stamped on every
+  // bridged task event (distinct from the nested `runHandles.runId` Codex keep
+  // for their own workflows). Last writer wins so the agent always reflects the
+  // live generation; a reused `sa-1` across restart generations keeps its current
+  // run id rather than leaking the previous one into the roster.
+  const childRunId = asString(payload.runId);
+  if (childRunId) {
+    agent.childRunId = childRunId;
   }
 }
 

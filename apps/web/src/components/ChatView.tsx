@@ -219,6 +219,8 @@ import {
   deriveAgentPanelModel,
   foldSubagentActivities,
 } from "@t3tools/client-runtime/state/subagentRuntime";
+import { mergeProviderChildren } from "@t3tools/client-runtime/state/childAgents";
+import { useChildAgentRoster } from "../hooks/useChildAgentRoster";
 import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
@@ -2756,6 +2758,22 @@ export default function ChatView(props: ChatViewProps) {
         agents: foldSubagentActivities(threadActivities, { sessionLive: agentSessionLive }),
       }),
     [agentSessionLive, threadActivities],
+  );
+  // Durable provider-child roster (Pi subagents today), shared with the Agents
+  // panel. It lives here rather than in the panel so the activity indicator,
+  // launcher badge, and roster all read the same merged model.
+  const {
+    children: providerChildren,
+    error: providerChildrenError,
+    loading: providerChildrenLoading,
+    refresh: refreshProviderChildren,
+  } = useChildAgentRoster(
+    activeThreadRef?.environmentId ?? null,
+    activeThreadRef?.threadId ?? null,
+  );
+  const agentLiveCount = useMemo(
+    () => mergeProviderChildren(agentPanelModel, providerChildren).liveCount,
+    [agentPanelModel, providerChildren],
   );
   const { approvals: pendingApprovals, userInputs: pendingUserInputs } = useMemo(
     () => derivePendingRequests(threadActivities),
@@ -6023,7 +6041,7 @@ export default function ChatView(props: ChatViewProps) {
       return null;
     }
     const working = activeBackgroundLiveness === "working";
-    const liveCount = agentPanelModel.liveCount;
+    const liveCount = agentLiveCount;
     return {
       id: `background-liveness:${activeThread.id}`,
       variant: "default",
@@ -6053,7 +6071,7 @@ export default function ChatView(props: ChatViewProps) {
   }, [
     activeBackgroundLiveness,
     activeThread,
-    agentPanelModel.liveCount,
+    agentLiveCount,
     handleStopBackgroundWork,
     isStoppingBackgroundWork,
   ]);
@@ -8616,7 +8634,7 @@ export default function ChatView(props: ChatViewProps) {
       // Suppressed while the Agents surface is visible: the roster itself is
       // on screen, so the toggle badge would be pointing at nothing.
       liveAgentCount={
-        rightPanelOpen && activeRightPanelSurface?.kind === "agents" ? 0 : agentPanelModel.liveCount
+        rightPanelOpen && activeRightPanelSurface?.kind === "agents" ? 0 : agentLiveCount
       }
       onToggleTerminal={toggleTerminalVisibility}
       onToggleRightPanel={toggleRightPanel}
@@ -8754,6 +8772,10 @@ export default function ChatView(props: ChatViewProps) {
     ) : renderedRightPanelSurface?.kind === "agents" ? (
       <AgentsPanel
         model={agentPanelModel}
+        providerChildren={providerChildren}
+        providerChildrenError={providerChildrenError}
+        providerChildrenLoading={providerChildrenLoading}
+        onRefreshProviderChildren={refreshProviderChildren}
         environmentId={activeThreadRef?.environmentId ?? null}
         threadId={activeThreadRef?.threadId ?? null}
       />
@@ -9400,9 +9422,9 @@ export default function ChatView(props: ChatViewProps) {
           filesAvailable={activeProject !== null}
           pullRequestAvailable={pullRequestSurfaceAvailable}
           pullRequestsAvailable={pullRequestsSurfaceAvailable}
-          agentsAvailable
+          agentsAvailable={activeThreadRef !== null}
           deviceAvailable={activeThreadRef !== null}
-          liveAgentCount={agentPanelModel.liveCount}
+          liveAgentCount={agentLiveCount}
         >
           {rightPanelContent}
         </RightPanelTabs>
@@ -9458,9 +9480,9 @@ export default function ChatView(props: ChatViewProps) {
             filesAvailable={activeProject !== null}
             pullRequestAvailable={pullRequestSurfaceAvailable}
             pullRequestsAvailable={pullRequestsSurfaceAvailable}
-            agentsAvailable
+            agentsAvailable={activeThreadRef !== null}
             deviceAvailable={activeThreadRef !== null}
-            liveAgentCount={agentPanelModel.liveCount}
+            liveAgentCount={agentLiveCount}
           >
             {rightPanelContent}
           </RightPanelTabs>
