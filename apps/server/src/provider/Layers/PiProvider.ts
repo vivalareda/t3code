@@ -13,14 +13,15 @@
  */
 import * as NodeOS from "node:os";
 import {
+  PI_DEFAULT_MODEL,
   type CustomModelSetting,
   type PiSettings,
   type ServerProviderModel,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
-import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import { createModelCapabilities } from "@t3tools/shared/model";
 
 import { expandHomePath } from "../../pathExpansion.ts";
@@ -28,7 +29,6 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
 import { closePiRpcConnection, makePiRpcConnectionIn } from "../pi/PiRpcConnection.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import * as Scope from "effect/Scope";
 
 import {
   buildServerProvider as buildProviderSnapshot,
@@ -60,18 +60,22 @@ const EMPTY_CAPABILITIES = createModelCapabilities({
 /**
  * Instance-scoped model catalog. The adapter fills it from live sessions
  * (`get_available_models`); the explicit refresh probe fills it from a
- * short-lived `--no-session` RPC process.
+ * short-lived `--no-session` RPC process. `changes` republishes on every
+ * write so the driver can fold live updates into the managed snapshot without
+ * waiting for the next health timer or explicit refresh.
  */
 export interface PiModelCatalog {
   readonly get: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
   readonly set: (models: ReadonlyArray<ServerProviderModel>) => Effect.Effect<void>;
+  readonly changes: Stream.Stream<ReadonlyArray<ServerProviderModel>>;
 }
 
 export const makePiModelCatalog = Effect.gen(function* () {
-  const ref = yield* Ref.make<ReadonlyArray<ServerProviderModel>>([]);
+  const ref = yield* SubscriptionRef.make<ReadonlyArray<ServerProviderModel>>([]);
   return {
-    get: Ref.get(ref),
-    set: (models) => Ref.set(ref, models),
+    get: SubscriptionRef.get(ref),
+    set: (models) => SubscriptionRef.set(ref, models),
+    changes: SubscriptionRef.changes(ref),
   } satisfies PiModelCatalog;
 });
 
@@ -227,12 +231,19 @@ const spawnVersionProbe = Effect.fn("spawnVersionProbe")(function* (
   );
 });
 
-/** Discovered models first (they carry real names), then settings customs. */
+/** Native default first, then discovered models and settings customs. */
 export function mergePiModels(
   discovered: ReadonlyArray<ServerProviderModel>,
   customModels: ReadonlyArray<CustomModelSetting> | undefined,
 ): ReadonlyArray<ServerProviderModel> {
-  const seen = new Set(discovered.map((model) => model.slug));
+  const nativeDefault: ServerProviderModel = {
+    slug: PI_DEFAULT_MODEL,
+    name: "Pi default",
+    isDefault: true,
+    isCustom: false,
+    capabilities: EMPTY_CAPABILITIES,
+  };
+  const seen = new Set([PI_DEFAULT_MODEL, ...discovered.map((model) => model.slug)]);
   const customEntries: ServerProviderModel[] = [];
   for (const entry of customModels ?? []) {
     const slug = typeof entry === "string" ? entry : entry.slug;
@@ -248,7 +259,7 @@ export function mergePiModels(
         typeof entry !== "string" ? (entry.capabilities ?? EMPTY_CAPABILITIES) : EMPTY_CAPABILITIES,
     });
   }
-  return [...discovered, ...customEntries];
+  return [nativeDefault, ...discovered, ...customEntries];
 }
 
 /**
@@ -263,40 +274,47 @@ export const discoverPiModelsViaRpc = Effect.fn("discoverPiModelsViaRpc")(functi
 ): Effect.fn.Return<
   ReadonlyArray<ServerProviderModel>,
   never,
-  ChildProcessSpawner.ChildProcessSpawner | Scope.Scope
+  ChildProcessSpawner.ChildProcessSpawner
 > {
   const resolvedProfile = piSettings.profileDir ? expandHomePath(piSettings.profileDir) : undefined;
   const env = resolvedProfile
     ? { ...environment, PI_CODING_AGENT_DIR: resolvedProfile }
     : environment;
-  const connection = yield* makePiRpcConnectionIn({
-    binaryPath: piSettings.binaryPath,
-    args: ["--mode", "rpc", "--no-session"],
-    cwd: NodeOS.tmpdir(),
-    env,
-  }).pipe(
-    Effect.catch(() => Effect.succeed(null)),
-    Effect.map((value) => value as import("../pi/PiRpcConnection.ts").PiRpcConnectionHandle | null),
-  );
-  if (connection === null) return [];
-  const outcome = yield* connection
-    .request({ type: "get_available_models" }, { timeoutMs: 20_000 })
-    .pipe(Effect.exit);
-  yield* closePiRpcConnection(connection);
-  if (Exit.isFailure(outcome)) return [];
-  const data = outcome.value;
-  const models = data?.["models"];
+  return yield* Effect.acquireUseRelease(
+    makePiRpcConnectionIn({
+      binaryPath: piSettings.binaryPath,
+      args: ["--mode", "rpc", "--no-session"],
+      cwd: NodeOS.tmpdir(),
+      env,
+    }),
+    (connection) =>
+      connection
+        .request({ type: "get_available_models" }, { timeoutMs: 20_000 })
+        .pipe(Effect.map(parsePiAvailableModels)),
+    closePiRpcConnection,
+  ).pipe(Effect.catch(() => Effect.succeed([])));
+});
+
+/**
+ * Parse a `get_available_models` response into T3 model entries. Shared by the
+ * explicit discovery probe and (via the adapter hook) live sessions so both
+ * paths normalize malformed RPC payloads identically. Entries missing a
+ * non-empty `id`/`provider` are skipped; `name` falls back to `id`.
+ */
+export const parsePiAvailableModels = (data: unknown): ReadonlyArray<ServerProviderModel> => {
+  if (typeof data !== "object" || data === null) return [];
+  const models = (data as Record<string, unknown>)["models"];
   if (!Array.isArray(models)) return [];
   const resolved: ServerProviderModel[] = [];
   for (const entry of models) {
     if (typeof entry !== "object" || entry === null) continue;
     const record = entry as Record<string, unknown>;
-    const id = typeof record["id"] === "string" ? record["id"] : undefined;
-    const provider = typeof record["provider"] === "string" ? record["provider"] : undefined;
-    if (id === undefined || provider === undefined) continue;
+    const id = typeof record["id"] === "string" ? record["id"] : "";
+    const provider = typeof record["provider"] === "string" ? record["provider"] : "";
+    if (id.length === 0 || provider.length === 0) continue;
     resolved.push({
       slug: `${provider}/${id}`,
-      name: typeof record["name"] === "string" ? record["name"] : id,
+      name: typeof record["name"] === "string" && record["name"].length > 0 ? record["name"] : id,
       isCustom: false,
       capabilities: createModelCapabilities({
         optionDescriptors:
@@ -314,6 +332,6 @@ export const discoverPiModelsViaRpc = Effect.fn("discoverPiModelsViaRpc")(functi
     });
   }
   return resolved;
-});
+};
 
 const PI_REASONING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;

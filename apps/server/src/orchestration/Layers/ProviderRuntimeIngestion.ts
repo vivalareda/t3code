@@ -2247,20 +2247,7 @@ const make = Effect.gen(function* () {
         event.type === "task.progress" ||
         event.type === "task.transcript"
       ) {
-        const payload = event.payload as {
-          taskId: string;
-          status?: string;
-          title?: string;
-          model?: string;
-          effort?: string;
-          error?: string;
-          summary?: string;
-          seq?: number;
-          chunk?: unknown;
-          typedUsage?: { totalTokens?: number };
-          taskType?: string;
-        };
-        if (payload.taskType === "subagent" && event.providerInstanceId !== undefined) {
+        if (event.payload.taskType === "subagent" && event.providerInstanceId !== undefined) {
           const runId = resolveChildRunId(event);
           if (runId === undefined) {
             // Never invent a generation: a child event without a run id is
@@ -2268,24 +2255,24 @@ const make = Effect.gen(function* () {
             yield* Effect.logWarning("dropping child event without a run id", {
               eventId: event.eventId,
               eventType: event.type,
-              taskId: payload.taskId,
+              taskId: event.payload.taskId,
             });
           } else {
             const childScope = {
               threadId: thread.id,
               instanceId: event.providerInstanceId,
               runId,
-              childId: payload.taskId,
+              childId: event.payload.taskId,
             };
-            const logFailure = logChildRowFailure(event.eventId, event.type, payload.taskId);
+            const logFailure = logChildRowFailure(event.eventId, event.type, event.payload.taskId);
             const nowIso = event.createdAt;
             if (event.type === "task.transcript") {
-              if (typeof payload.seq === "number" && payload.chunk !== undefined) {
+              if (typeof event.payload.seq === "number" && event.payload.chunk !== undefined) {
                 yield* projectionChildTranscriptRepository
                   .appendChunk({
                     ...childScope,
-                    seq: payload.seq,
-                    chunk: payload.chunk,
+                    seq: event.payload.seq,
+                    chunk: event.payload.chunk,
                     createdAt: nowIso,
                   })
                   .pipe(Effect.catchCause(logFailure));
@@ -2294,11 +2281,11 @@ const make = Effect.gen(function* () {
               yield* projectionChildTranscriptRepository
                 .upsertState({
                   ...childScope,
-                  title: payload.title ?? null,
+                  title: event.payload.title ?? null,
                   backend: "pi",
                   cwd: null,
-                  model: payload.model ?? null,
-                  effort: payload.effort ?? null,
+                  model: event.payload.model ?? null,
+                  effort: event.payload.effort ?? null,
                   status: "running",
                   outcomeStatus: null,
                   summary: null,
@@ -2311,20 +2298,20 @@ const make = Effect.gen(function* () {
                 })
                 .pipe(Effect.catchCause(logFailure));
             } else if (event.type === "task.updated") {
-              const updatedStatus = toChildTranscriptStatus(payload.status);
+              const updatedStatus = toChildTranscriptStatus(event.payload.status);
               const terminal = updatedStatus !== "running";
               yield* projectionChildTranscriptRepository
                 .upsertState({
                   ...childScope,
-                  title: payload.title ?? null,
+                  title: event.payload.title ?? null,
                   backend: null,
                   cwd: null,
-                  model: payload.model ?? null,
-                  effort: payload.effort ?? null,
+                  model: event.payload.model ?? null,
+                  effort: event.payload.effort ?? null,
                   status: updatedStatus,
                   outcomeStatus: terminal ? updatedStatus : null,
                   summary: null,
-                  errorText: payload.error ?? null,
+                  errorText: event.payload.error ?? null,
                   tokens: null,
                   contextWindow: null,
                   startedAt: null,
@@ -2333,7 +2320,7 @@ const make = Effect.gen(function* () {
                 })
                 .pipe(Effect.catchCause(logFailure));
             } else if (event.type === "task.progress") {
-              const totalTokens = payload.typedUsage?.totalTokens;
+              const totalTokens = event.payload.typedUsage?.totalTokens;
               yield* projectionChildTranscriptRepository
                 .upsertState({
                   ...childScope,
@@ -2364,14 +2351,14 @@ const make = Effect.gen(function* () {
                   model: null,
                   effort: null,
                   status:
-                    payload.status === "completed"
+                    event.payload.status === "completed"
                       ? "done"
-                      : payload.status === "stopped"
+                      : event.payload.status === "stopped"
                         ? "cancelled"
                         : "error",
-                  outcomeStatus: payload.status ?? null,
-                  summary: payload.summary ?? null,
-                  errorText: payload.error ?? null,
+                  outcomeStatus: event.payload.status ?? null,
+                  summary: event.payload.summary ?? null,
+                  errorText: event.payload.error ?? null,
                   tokens: null,
                   contextWindow: null,
                   startedAt: null,

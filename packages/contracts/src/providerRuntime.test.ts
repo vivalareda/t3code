@@ -60,6 +60,33 @@ describe("ProviderRuntimeEvent", () => {
     ).toBe("turn.completed");
   });
 
+  it("preserves terminal child errors through the runtime event schema", () => {
+    const event = {
+      type: "task.completed",
+      eventId: "child-failed",
+      provider: "pi",
+      providerInstanceId: "pi-local",
+      createdAt: "2026-09-15T00:00:00.000Z",
+      threadId: "thread-1",
+      payload: {
+        taskId: "sa-1",
+        taskType: "subagent",
+        runId: "run-1",
+        status: "failed",
+        error: "Child provider rejected the request",
+      },
+    };
+
+    const parsed = decodeRuntimeEvent(event);
+    expect(parsed.type).toBe("task.completed");
+    if (parsed.type !== "task.completed") throw new Error("expected task.completed");
+    expect(parsed.payload.error).toBe(event.payload.error);
+    expect(parsed.payload.runId).toBe("run-1");
+    expect(() =>
+      decodeRuntimeEvent({ ...event, payload: { ...event.payload, error: 123 } }),
+    ).toThrow();
+  });
+
   it("accepts fork-provided driver kinds as branded slugs", () => {
     const parsed = decodeRuntimeEvent({
       type: "session.started",

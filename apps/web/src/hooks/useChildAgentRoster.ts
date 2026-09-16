@@ -1,4 +1,9 @@
-import type { ChildAgentState, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type {
+  ChildAgentState,
+  EnvironmentId,
+  ProviderDriverKind,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
   type ChildAgentRosterListResult,
   type ChildAgentRosterScope,
@@ -38,12 +43,14 @@ export interface ChildAgentRoster {
 export function useChildAgentRoster(
   environmentId: EnvironmentId | null,
   threadId: ThreadId | null,
+  driver: ProviderDriverKind | null,
 ): ChildAgentRoster {
   const listChildAgents = useAtomCommand(serverEnvironment.listChildAgents, {
     label: "child agent list",
     reportFailure: false,
   });
-  const canLoad = environmentId !== null && threadId !== null;
+  // Only Pi persists provider children; use the resolved driver, not its instance ID.
+  const canLoad = driver === "pi" && environmentId !== null && threadId !== null;
   const scope = canLoad ? `${environmentId}:${threadId}` : null;
 
   const [controller] = useState(() =>

@@ -11,7 +11,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
-  type ProviderRuntimeEvent,
+  ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import { Deferred, Effect, Layer, PubSub, Schema, Stream } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -49,6 +49,7 @@ const instanceId = ProviderInstanceId.make("pi-integration-instance");
 const provider = ProviderDriverKind.make("pi");
 const createdAt = "2026-09-14T00:00:00.000Z";
 const decodePiSettings = Schema.decodeSync(PiSettings);
+const decodeRuntimeEvent = Schema.decodeUnknownSync(ProviderRuntimeEvent);
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeJson = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -303,6 +304,37 @@ const initializeHarness = Effect.fn(function* (
 });
 
 describe("Pi child integration", () => {
+  it.effect("preserves a terminal child error through the runtime schema and persistence", () =>
+    withHarness((h) =>
+      Effect.gen(function* () {
+        yield* h.send([
+          { type: "agent_start" },
+          entry({ type: "child.started", childId: "sa-1", title: "Review", backend: "pi" }),
+          entry({
+            type: "child.result",
+            childId: "sa-1",
+            status: "error",
+            errorText: "Model request failed",
+          }),
+          { type: "agent_settled" },
+        ]);
+
+        const completed = h.events.find((event) => event.type === "task.completed");
+        const decoded = decodeRuntimeEvent(completed);
+        expect(decoded.type).toBe("task.completed");
+        if (decoded.type !== "task.completed") throw new Error("expected task.completed");
+        expect(decoded.payload.error).toBe("Model request failed");
+        const { children } = yield* h.control.list({ threadId });
+        expect(children).toHaveLength(1);
+        expect(children[0]).toMatchObject({
+          childId: "sa-1",
+          status: "error",
+          errorText: "Model request failed",
+        });
+      }),
+    ),
+  );
+
   it.effect("persists extension-shaped incremental output and a provider-initiated recap", () =>
     withHarness((h) =>
       Effect.gen(function* () {
