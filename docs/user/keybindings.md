@@ -3,6 +3,26 @@
 Customize shortcuts in **Settings → Keybindings** on web and desktop. That page
 also lists the command IDs and defaults available in your version.
 
+## Leader key
+
+Press **Space**, then a short sequence, to reach common actions from anywhere in
+the web and desktop app, including Settings. The sequence waits for the next key
+with no time limit; pause for a moment and a small popup lists what can follow.
+Esc or any other key cancels it.
+
+| Sequence    | Action                                           |
+| ----------- | ------------------------------------------------ |
+| `Space f f` | Find a thread: opens the command palette         |
+| `Space m`   | Choose a model for the open conversation         |
+| `Space n`   | New thread, the same as the sidebar **+** button |
+| `Space a`   | Add a project                                    |
+
+Space starts a sequence when no text field has focus, or when the composer is in
+vim normal mode. In insert mode it types a space. It does not fire while a dialog
+or menu is open. The bindings are fixed; the ⌘ and Ctrl shortcuts below are
+unaffected. If your vimrc sets `let mapleader = " "`, choose a different
+composer leader such as `,` because the app owns Space.
+
 ## Composer controls
 
 In **Settings → General → Send shortcut**, choose whether Enter sends, requires

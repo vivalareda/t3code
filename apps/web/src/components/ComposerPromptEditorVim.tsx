@@ -19,7 +19,11 @@ import {
 } from "~/composer-logic";
 import { collectComposerPromptInlineTokens } from "~/composer-editor-mentions";
 import { usePrimarySettings } from "~/hooks/useSettings";
-import { applyComposerVimrc, installComposerVimClipboard } from "~/lib/composerVim";
+import {
+  applyComposerVimrc,
+  installComposerVimClipboard,
+  isVimIdleNormal,
+} from "~/lib/composerVim";
 import { collectInlineContextIds } from "~/lib/composerContextReferences";
 import { cn } from "~/lib/utils";
 import { getTimelinePageScrollKey } from "./chat/pageScrollController";
@@ -224,13 +228,7 @@ export function ComposerPromptEditorVim(props: ComposerPromptEditorProps) {
 
       if (event.key === "Escape" && isPlainKey(event)) {
         if (handler?.("Escape", event)) return consume();
-        const idle =
-          vimState !== null &&
-          !vimState.insertMode &&
-          !vimState.visualMode &&
-          !vimState.inputState.operator &&
-          vimState.inputState.keyBuffer.length === 0;
-        if (idle) {
+        if (isVimIdleNormal(vimState)) {
           view.contentDOM.blur();
           return consume();
         }

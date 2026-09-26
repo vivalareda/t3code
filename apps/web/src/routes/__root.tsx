@@ -18,6 +18,7 @@ import { APP_BASE_NAME, APP_DISPLAY_NAME, APP_STAGE_LABEL, APP_VERSION } from ".
 import { resolveServerBackedAppDisplayName } from "../branding.logic";
 import { AppSidebarLayout } from "../components/AppSidebarLayout";
 import { CommandPalette } from "../components/CommandPalette";
+import { LeaderKeyHost } from "../components/LeaderKeyHost";
 import { CustomSnoozeDialogHost } from "../components/CustomSnoozeDialog";
 import { ConfirmDialogHost } from "../components/ConfirmDialogHost";
 import { FirstRunGate } from "../components/onboarding/FirstRunGate";
@@ -198,6 +199,7 @@ function RootRouteView() {
 
   const appShell = (
     <CommandPalette>
+      <LeaderKeyHost />
       <AppSidebarLayout>
         <Outlet />
       </AppSidebarLayout>

@@ -15,6 +15,8 @@ export interface ParsedVimrc {
   /** Ex commands to run through `Vim.handleEx`, in order. */
   readonly commands: ReadonlyArray<string>;
   readonly warnings: ReadonlyArray<VimrcWarning>;
+  /** The mapleader in effect at the end of the file, as a codemirror-vim key name. */
+  readonly leader: string;
 }
 
 const MAP_COMMANDS: Record<string, string> = {
@@ -120,5 +122,5 @@ export function parseVimrc(source: string, isKnownOption: (name: string) => bool
     warn(`\`${command}\` is not supported`);
   });
 
-  return { commands, warnings };
+  return { commands, warnings, leader };
 }

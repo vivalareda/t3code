@@ -1,6 +1,32 @@
-import { Vim, type CodeMirrorV } from "@replit/codemirror-vim";
+import { EditorView } from "@codemirror/view";
+import { getCM, Vim, type CodeMirrorV } from "@replit/codemirror-vim";
 
 import { parseVimrc, type ParsedVimrc } from "./vimrc";
+
+type VimState = NonNullable<CodeMirrorV["state"]["vim"]>;
+
+/** Normal mode with nothing typed yet: no operator, count, or partial key. */
+export function isVimIdleNormal(vim: VimState | null | undefined): boolean {
+  return (
+    vim != null &&
+    !vim.insertMode &&
+    !vim.visualMode &&
+    !vim.inputState.operator &&
+    vim.inputState.keyBuffer.length === 0
+  );
+}
+
+/**
+ * Whether `target` is the composer's vim editor resting in normal mode, where
+ * Space is the app leader rather than a motion.
+ */
+export function isComposerVimIdleNormal(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const editor = target.closest<HTMLElement>(".composer-vim");
+  const view = editor ? EditorView.findFromDOM(editor) : null;
+  const cm = view ? (getCM(view) as CodeMirrorV | null) : null;
+  return isVimIdleNormal(cm?.state.vim);
+}
 
 export function isKnownVimOption(name: string): boolean {
   return name.length > 0 && !(Vim.getOption(name) instanceof Error);

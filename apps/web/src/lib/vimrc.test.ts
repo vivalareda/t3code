@@ -13,7 +13,7 @@ describe("parseVimrc", () => {
   });
 
   it("expands <leader> with the mapleader in effect when the map is defined", () => {
-    const { commands, warnings } = parse(
+    const { commands, warnings, leader } = parse(
       [
         "nnoremap <leader>a A",
         'let mapleader = " "',
@@ -24,6 +24,13 @@ describe("parseVimrc", () => {
     );
     expect(commands).toEqual(["nnoremap \\a A", "nnoremap <Space>w :w<CR>", "nnoremap ,q :q<CR>"]);
     expect(warnings).toEqual([]);
+    expect(leader).toBe(",");
+  });
+
+  it("reports a Space leader so Settings can warn that the app owns Space", () => {
+    expect(parse('let mapleader = " "').leader).toBe("<Space>");
+    expect(parse("let mapleader = '\\<Space>'").leader).toBe("<Space>");
+    expect(parse("").leader).toBe("\\");
   });
 
   it("keeps known set options, including no-prefixed booleans, and flags unknown ones", () => {

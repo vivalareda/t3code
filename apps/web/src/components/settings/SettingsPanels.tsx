@@ -3485,7 +3485,7 @@ export function ArchivedThreadsPanel() {
 function VimrcEditor(props: { value: string; onCommit: (value: string) => void }) {
   const [draft, setDraft] = useState(props.value);
   useEffect(() => setDraft(props.value), [props.value]);
-  const warnings = useMemo(() => parseComposerVimrc(draft).warnings, [draft]);
+  const { warnings, leader } = useMemo(() => parseComposerVimrc(draft), [draft]);
   return (
     <div className="mt-3 space-y-2">
       <Textarea
@@ -3499,6 +3499,13 @@ function VimrcEditor(props: { value: string; onCommit: (value: string) => void }
         spellCheck={false}
         aria-label="Vimrc"
       />
+      {leader === "<Space>" ? (
+        <p className="text-xs text-warning-foreground">
+          Space is the app leader and never reaches the composer, so <code>&lt;leader&gt;</code>{" "}
+          mappings will not run. Pick a different composer leader, such as{" "}
+          <code>let mapleader = &quot;,&quot;</code>.
+        </p>
+      ) : null}
       {warnings.length > 0 ? (
         <ul className="space-y-0.5 text-xs text-muted-foreground">
           {warnings.map((warning) => (
