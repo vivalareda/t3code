@@ -371,6 +371,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["composer rich text tiptap bold italic markdown styled wysiwyg"],
   },
   {
+    id: "composer-vimrc",
+    title: "Vimrc",
+    to: "/settings/general",
+    searchTerms: ["vim neovim nvim mappings map noremap leader keybindings composer modal"],
+  },
+  {
     id: "composer-collapse",
     title: "Collapse composer on scroll",
     to: "/settings/general",

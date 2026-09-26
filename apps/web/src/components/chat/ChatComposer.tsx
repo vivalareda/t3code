@@ -82,7 +82,7 @@ import {
   replaceTextRange,
 } from "../../composer-logic";
 import { DISCONNECTED_COMPOSER_PLACEHOLDER } from "../../composerPlaceholder";
-import { listContinuationForEnter, listIndentForTab } from "../../composer-list-continuation";
+import { listContinuationForEnter } from "../../composer-list-continuation";
 import {
   deriveComposerSendState,
   getAntigravitySendBlockReason,
@@ -4361,25 +4361,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }
     // Native task splitting preserves marks and chips on both sides of the caret.
     if (key === "Enter" && isTaskItem) return false;
-    if (!event.isComposing && (key === "Enter" || (key === "Tab" && !event.shiftKey))) {
+    // Vim fork: Tab only accepts a menu item, so it never indents lists.
+    if (!event.isComposing && key === "Enter") {
       const selection = composerEditorRef.current?.readSelectionRange();
       const snapshot = readComposerSnapshot();
       if (selection && selection.start === selection.end && snapshot.value === promptRef.current) {
-        const edit =
-          key === "Enter"
-            ? listContinuationForEnter(snapshot.value, selection.start)
-            : listIndentForTab(snapshot.value, selection.start, selection.end);
-        if (
-          edit &&
-          applyPromptReplacement(
-            edit.start,
-            edit.end,
-            edit.replacement,
-            key === "Tab"
-              ? { expandedCursorAfterReplace: selection.start + edit.replacement.length }
-              : undefined,
-          )
-        ) {
+        const edit = listContinuationForEnter(snapshot.value, selection.start);
+        if (edit && applyPromptReplacement(edit.start, edit.end, edit.replacement)) {
           return true;
         }
       }

@@ -134,6 +134,8 @@ import { Switch } from "../ui/switch";
 import { ScopedSwitch } from "./ScopedSwitch";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { Textarea } from "../ui/textarea";
+import { parseComposerVimrc } from "../../lib/composerVim";
 import { ThemeLibrary } from "./ThemeSettings";
 import {
   backgroundActivityOverrideSettings,
@@ -2620,6 +2622,23 @@ export function GeneralSettingsPanel() {
         />
 
         <SettingsRow
+          serverScoped
+          settingKeys={["vimrc"]}
+          {...searchableSetting("composer-vimrc")}
+          description="Mappings, `let mapleader`, and supported `set` options for the composer's vim mode. Applied when the field loses focus."
+          resetAction={
+            settings.vimrc !== DEFAULT_UNIFIED_SETTINGS.vimrc ? (
+              <SettingResetButton
+                label="vimrc"
+                onClick={() => updateSettings({ vimrc: DEFAULT_UNIFIED_SETTINGS.vimrc })}
+              />
+            ) : null
+          }
+        >
+          <VimrcEditor value={settings.vimrc} onCommit={(vimrc) => updateSettings({ vimrc })} />
+        </SettingsRow>
+
+        <SettingsRow
           {...searchableSetting("composer-collapse")}
           description="Rest the composer of an existing thread into a single line when you scroll the conversation. Focus the composer or start typing to expand it again."
           resetAction={
@@ -3460,5 +3479,35 @@ export function ArchivedThreadsPanel() {
         ))
       )}
     </SettingsPageContainer>
+  );
+}
+
+function VimrcEditor(props: { value: string; onCommit: (value: string) => void }) {
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+  const warnings = useMemo(() => parseComposerVimrc(draft).warnings, [draft]);
+  return (
+    <div className="mt-3 space-y-2">
+      <Textarea
+        size="sm"
+        className="font-mono"
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={() => {
+          if (draft !== props.value) props.onCommit(draft);
+        }}
+        spellCheck={false}
+        aria-label="Vimrc"
+      />
+      {warnings.length > 0 ? (
+        <ul className="space-y-0.5 text-xs text-muted-foreground">
+          {warnings.map((warning) => (
+            <li key={`${warning.line}:${warning.reason}`}>
+              Line {warning.line} ignored: {warning.reason}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
   );
 }

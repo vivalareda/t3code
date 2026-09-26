@@ -2141,6 +2141,56 @@ code {
   }
 }
 
+/* Vim composer (CodeMirror + codemirror-vim). Wrapping follows the root's
+   white-space so the resting composer's `whitespace-pre` keeps one line. */
+.composer-vim.cm-editor {
+  display: flex;
+}
+
+.composer-vim.cm-editor.cm-focused {
+  outline: none;
+}
+
+.composer-vim .cm-scroller {
+  overflow-y: auto;
+  font-family: inherit;
+  line-height: inherit;
+}
+
+.composer-vim .cm-content {
+  padding: 0.25rem;
+  white-space: inherit;
+  overflow-wrap: anywhere;
+  flex-shrink: 1;
+  caret-color: var(--foreground);
+}
+
+.composer-vim .cm-line {
+  padding: 0;
+}
+
+.composer-vim .cm-fat-cursor {
+  background: var(--foreground);
+  color: var(--background) !important;
+}
+
+.composer-vim:not(.cm-focused) .cm-fat-cursor {
+  background: none;
+  outline: solid 1px var(--muted-foreground);
+  color: transparent !important;
+}
+
+.composer-vim .cm-selectionBackground,
+.composer-vim.cm-focused .cm-selectionBackground {
+  background: color-mix(in oklab, var(--primary) 25%, transparent);
+}
+
+.composer-vim-token {
+  color: var(--primary);
+  background: color-mix(in oklab, var(--primary) 12%, transparent);
+  border-radius: 0.3em;
+}
+
 /* Rich text composer (Tiptap). The stored prompt stays markdown; only the
    surface renders styled text. Markers (** * ` ~~) appear as non-editable
    widgets while the caret is on styled text. */

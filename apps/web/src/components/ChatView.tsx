@@ -725,12 +725,17 @@ function shouldRedirectInputToComposer(event: Event): boolean {
   return true;
 }
 
-function shouldTypeToFocusComposer(event: KeyboardEvent): boolean {
-  if (event.isComposing) return false;
-  if (event.metaKey || event.ctrlKey || event.altKey) return false;
-  if (event.key.length !== 1) return false;
-  if (!shouldRedirectInputToComposer(event)) return false;
-
+/**
+ * Vim fork: with nothing editable focused, `i` or Tab enters the composer in
+ * insert mode. Other keys no longer type into it, leaving them free for
+ * app-level bindings.
+ */
+function shouldVimFocusComposer(event: KeyboardEvent): boolean {
+  if (event.isComposing || event.defaultPrevented) return false;
+  if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return false;
+  if (event.key !== "i" && event.key !== "Tab") return false;
+  if (eventPathContainsSelector(event, TYPE_TO_FOCUS_EDITABLE_SELECTOR)) return false;
+  if (document.querySelector(TYPE_TO_FOCUS_FLOATING_LAYER_SELECTOR)) return false;
   return true;
 }
 
@@ -7280,13 +7285,12 @@ export default function ChatView(props: ChatViewProps) {
       if (
         !shortcutContext.terminalFocus &&
         !shortcutContext.modelPickerOpen &&
-        shouldTypeToFocusComposer(event)
+        shouldVimFocusComposer(event)
       ) {
-        if (composerRef.current?.insertTextAtEnd(event.key)) {
-          event.preventDefault();
-          event.stopPropagation();
-          return;
-        }
+        event.preventDefault();
+        event.stopPropagation();
+        focusComposer();
+        return;
       }
 
       const command = resolveShortcutCommand(event, keybindings, {
@@ -7541,6 +7545,7 @@ export default function ChatView(props: ChatViewProps) {
     confirmAndUnpinThread,
     copyActiveThreadReference,
     getShortcutContext,
+    focusComposer,
     toggleRightPanel,
     toggleThreadPanel,
     toggleTerminalVisibility,
