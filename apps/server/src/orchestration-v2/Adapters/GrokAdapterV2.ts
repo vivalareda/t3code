@@ -7,6 +7,7 @@ import {
   GrokSettings,
   ProviderDriverKind,
   type OrchestrationV2ProviderCapabilities,
+  type RuntimeMode,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -38,6 +39,7 @@ import {
   extractXAiMonitorTaskId,
   isXAiPersistentMonitor,
   extractXAiExitPlanMarkdown,
+  registerXAiSubagentFinished,
   makeXAiAskUserQuestionCancelledResponse,
   makeXAiAskUserQuestionResponse,
   makeXAiExitPlanModeCapturedResponse,
@@ -47,11 +49,12 @@ import {
   XAiExitPlanModeRequest,
 } from "../../provider/acp/XAiAcpExtension.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
+import { acpPermissionDisposition } from "../../provider/acp/AcpClientPolicy.ts";
 import * as AcpSessionRuntime from "../../provider/acp/AcpSessionRuntime.ts";
 import { ProviderEventLoggers } from "../../provider/Layers/ProviderEventLoggers.ts";
 import { IdAllocatorV2 } from "../IdAllocator.ts";
 import { ProviderContinuationRequests } from "../ProviderContinuationRequests.ts";
-import { ProviderAdapterV2 } from "../ProviderAdapter.ts";
+import { ProviderAdapterV2, type ProviderAdapterV2RuntimePolicy } from "../ProviderAdapter.ts";
 import {
   ProviderAdapterDriverCreateError,
   type ProviderAdapterDriver,
@@ -127,10 +130,12 @@ const registerGrokAcpExtensions: NonNullable<AcpAdapterV2Flavor["registerExtensi
   runtime,
   requestUserInput,
   applyBackgroundTaskMutation,
+  finishSubagent,
   captureProposedPlan,
   lastProposedPlanMarkdown,
 }) =>
   registerXAiBackgroundTaskTracking(runtime, applyBackgroundTaskMutation).pipe(
+    Effect.andThen(registerXAiSubagentFinished(runtime, finishSubagent)),
     Effect.andThen(registerGrokAskUserQuestionExtensions({ runtime, requestUserInput })),
     Effect.andThen(
       registerGrokExitPlanModeExtensions({
@@ -206,6 +211,17 @@ const registerGrokAskUserQuestionExtensions = ({
     { discard: true },
   );
 
+/**
+ * Grok's permission mode is fixed at launch. Explicit approval or sandbox
+ * overrides launch it asking, so every mutating prompt reaches T3's policy
+ * check instead of being bypassed by always-approve or Grok's auto classifier.
+ */
+export function grokLaunchRuntimeMode(runtimePolicy: ProviderAdapterV2RuntimePolicy): RuntimeMode {
+  return runtimePolicy.approvalPolicy === undefined && runtimePolicy.sandboxPolicy === undefined
+    ? runtimePolicy.runtimeMode
+    : "approval-required";
+}
+
 export function makeGrokAcpAdapterFlavor(options: GrokAdapterV2Options): AcpAdapterV2Flavor {
   return {
     driver: GROK_PROVIDER,
@@ -251,14 +267,19 @@ export function makeGrokAcpAdapterFlavor(options: GrokAdapterV2Options): AcpAdap
       }),
     makeRuntime:
       options.makeRuntime ??
-      ((input) =>
+      (({ runtimePolicy, ...input }) =>
         makeGrokAcpRuntime({
           ...input,
           interruptPromptOnCancel: input.interruptPromptOnCancel ?? false,
           grokSettings: options.settings,
           environment: options.environment,
           childProcessSpawner: options.childProcessSpawner,
+          runtimeMode: grokLaunchRuntimeMode(runtimePolicy),
         })),
+    // In its Auto mode Grok decides routine actions itself and only asks about
+    // what its classifier blocked, so every prompt it sends goes to the user.
+    permissionDisposition: (policy, request) =>
+      grokLaunchRuntimeMode(policy) === "auto" ? "ask" : acpPermissionDisposition(policy, request),
     promptFailure: (cause) =>
       makeProviderFailure({
         cause,

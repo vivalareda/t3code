@@ -20,6 +20,10 @@ import { claudeLocalBashTaskInput } from "./claude_local_bash_task/input.ts";
 import { assertClaudeLocalBashTaskOutput } from "./claude_local_bash_task/output.ts";
 import { claudeResultIsErrorInput } from "./claude_result_is_error/input.ts";
 import { assertClaudeResultIsErrorOutput } from "./claude_result_is_error/output.ts";
+import { grokAutoBlockedCommandInput } from "./grok_auto_blocked_command/input.ts";
+import { assertGrokAutoBlockedCommandOutput } from "./grok_auto_blocked_command/output.ts";
+import { grokBackgroundSubagentInput } from "./grok_background_subagent/input.ts";
+import { assertGrokBackgroundSubagentOutput } from "./grok_background_subagent/output.ts";
 import { grokMonitorInput } from "./grok_monitor/input.ts";
 import { assertGrokMonitorOutput } from "./grok_monitor/output.ts";
 import { grokSubagentLineageInput } from "./grok_subagent_lineage/input.ts";
@@ -40,6 +44,8 @@ import { assertPiMultiTurnOutput } from "./multi_turn/pi_output.ts";
 import { multiTurnInput } from "./multi_turn/input.ts";
 import { openCodeChildApprovalInput } from "./opencode_child_approval/input.ts";
 import { assertOpenCodeChildApprovalOutput } from "./opencode_child_approval/output.ts";
+import { openCodeRunningChildApprovalInput } from "./opencode_running_child_approval/input.ts";
+import { assertOpenCodeRunningChildApprovalOutput } from "./opencode_running_child_approval/output.ts";
 import { openCodeSubagentInput } from "./opencode_subagent/input.ts";
 import { assertOpenCodeSubagentOutput } from "./opencode_subagent/output.ts";
 import {
@@ -75,6 +81,8 @@ import {
   subagentV2ApprovalInput,
 } from "./subagent_v2_approval/input.ts";
 import { assertSubagentV2NestedOutput } from "./subagent_v2_nested/codex_output.ts";
+import { assertSubagentV2NestedApprovalOutput } from "./subagent_v2_nested_approval/codex_output.ts";
+import { subagentV2NestedApprovalInput } from "./subagent_v2_nested_approval/input.ts";
 import { assertClaudeThreadRollbackOutput } from "./thread_rollback/claude_output.ts";
 import { assertThreadRollbackOutput } from "./thread_rollback/codex_output.ts";
 import { threadRollbackInput } from "./thread_rollback/input.ts";
@@ -282,6 +290,37 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         ),
         modelSelection: CLAUDE_MODEL_SELECTION,
         assertOutput: assertClaudeResultIsErrorOutput,
+      },
+    ],
+  },
+  {
+    name: "grok_auto_blocked_command",
+    buildInput: grokAutoBlockedCommandInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("grok"),
+        transcriptFile: new URL(
+          "./grok_auto_blocked_command/grok_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: { ...GROK_MODEL_SELECTION, model: "grok-4.7-build-fast" },
+        assertOutput: assertGrokAutoBlockedCommandOutput,
+      },
+    ],
+  },
+  {
+    name: "grok_background_subagent",
+    buildInput: grokBackgroundSubagentInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("grok"),
+        transcriptFile: new URL(
+          "./grok_background_subagent/grok_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: GROK_MODEL_SELECTION,
+        runContinuationWorker: true,
+        assertOutput: assertGrokBackgroundSubagentOutput,
       },
     ],
   },
@@ -623,6 +662,22 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
     ],
   },
   {
+    name: "subagent_v2_nested_approval",
+    buildInput: subagentV2NestedApprovalInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("codex"),
+        transcriptFile: new URL(
+          "./subagent_v2_nested_approval/codex_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: CODEX_MODEL_SELECTION,
+        runtimePolicyOverride: SUBAGENT_V2_APPROVAL_POLICY,
+        assertOutput: assertSubagentV2NestedApprovalOutput,
+      },
+    ],
+  },
+  {
     name: "opencode_subagent",
     buildInput: openCodeSubagentInput,
     providers: [
@@ -646,6 +701,21 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         ),
         modelSelection: OPENCODE_MODEL_SELECTION,
         assertOutput: assertOpenCodeChildApprovalOutput,
+      },
+    ],
+  },
+  {
+    name: "opencode_running_child_approval",
+    buildInput: openCodeRunningChildApprovalInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("opencode"),
+        transcriptFile: new URL(
+          "./opencode_running_child_approval/opencode_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: OPENCODE_MODEL_SELECTION,
+        assertOutput: assertOpenCodeRunningChildApprovalOutput,
       },
     ],
   },

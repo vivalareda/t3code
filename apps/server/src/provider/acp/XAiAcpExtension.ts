@@ -45,11 +45,24 @@ const XAiSessionUpdateNotification = Schema.Struct({
     promptId: Schema.optional(Schema.String),
     stop_reason: Schema.optional(Schema.String),
     stopReason: Schema.optional(Schema.String),
+    // subagent_finished
+    child_session_id: Schema.optional(Schema.String),
+    status: Schema.optional(Schema.String),
+    output: Schema.optional(Schema.NullOr(Schema.String)),
+    error: Schema.optional(Schema.NullOr(Schema.String)),
   }),
   _meta: Schema.optional(Schema.Unknown),
 });
 
 type XAiSessionUpdateNotification = typeof XAiSessionUpdateNotification.Type;
+
+const decodeXAiSessionUpdateNotification = Schema.decodeUnknownEffect(XAiSessionUpdateNotification);
+
+const xAiSessionNotificationMethods = [
+  "x.ai/session_notification",
+  "_x.ai/session_notification",
+  "_x.ai/session/update",
+] as const;
 
 const XAI_TASK_COMPLETED_PROMPT_ID_PREFIX = "task-completed-";
 
@@ -443,6 +456,62 @@ export const registerXAiBackgroundTaskTracking = (
       runtime.handleExtNotification(method, XAiTaskLifecycleNotification, (notification) => {
         const mutation = xAiBackgroundTaskLifecycleMutation(notification, status);
         return mutation === null ? Effect.void : apply(mutation);
+      }),
+    { discard: true },
+  );
+
+/**
+ * A background subagent's end, sent on its PARENT session as
+ * `{ sessionUpdate: "subagent_finished", child_session_id, status, output, error }`
+ * (grok-build `crates/codegen/xai-grok-shell/src/extensions/notification.rs`
+ * `SessionUpdate::SubagentFinished`). `status` is exactly "completed",
+ * "failed" or "cancelled" (`SubagentResult::status()` in
+ * `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs`);
+ * `output` is the final text of a completed subagent and `error` the message
+ * of a failed one. Grok follows it with its own `subagent-completed-<id>` wake
+ * turn when `will_wake` is true.
+ */
+export interface XAiSubagentFinishedNotice {
+  readonly sessionId: string;
+  readonly childSessionId: string;
+  readonly status: "completed" | "failed" | "cancelled";
+  readonly result: string | null;
+}
+
+/** Null for other session updates, and for a status Grok does not define. */
+export function xAiSubagentFinishedNotice(
+  notification: XAiSessionUpdateNotification,
+): XAiSubagentFinishedNotice | null {
+  const update = notification.update;
+  const childSessionId = nonEmptyString(update.child_session_id);
+  if (update.sessionUpdate !== "subagent_finished" || childSessionId === undefined) return null;
+  const status = update.status;
+  if (status !== "completed" && status !== "failed" && status !== "cancelled") return null;
+  const text = status === "completed" ? update.output : update.error;
+  return {
+    sessionId: notification.sessionId,
+    childSessionId,
+    status,
+    result: nonEmptyString(text ?? undefined) ?? null,
+  };
+}
+
+/**
+ * Finishes background subagents from Grok's `subagent_finished`. These arrive
+ * on the session notification methods that also carry turn completion; a
+ * runtime from {@link makeXAiPromptCompletionRuntime} settles its prompt from
+ * each notification before passing it to this handler.
+ */
+export const registerXAiSubagentFinished = (
+  runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "handleExtNotification">,
+  finish: (notice: XAiSubagentFinishedNotice) => Effect.Effect<void>,
+): Effect.Effect<void> =>
+  Effect.forEach(
+    xAiSessionNotificationMethods,
+    (method) =>
+      runtime.handleExtNotification(method, XAiSessionUpdateNotification, (notification) => {
+        const notice = xAiSubagentFinishedNotice(notification);
+        return notice === null ? Effect.void : finish(notice);
       }),
     { discard: true },
   );
@@ -1397,6 +1466,14 @@ const rememberCompletedXAiPromptId = (
  */
 export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletionRuntime")(
   function* (runtime: AcpSessionRuntime.AcpSessionRuntime["Service"]) {
+    // Grok sends turn completion and other session updates (subagent_finished)
+    // on the same extension methods, and the client keeps one handler per
+    // method. This wrapper owns those methods: it settles prompts itself, then
+    // passes each notification to the handler registered on the wrapped runtime.
+    const sessionNotificationHandlers = new Map<
+      string,
+      (params: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>
+    >();
     let nextPromptFallbackId = 0;
     const allocatePromptFallbackId = Effect.sync(() => {
       nextPromptFallbackId += 1;
@@ -1426,20 +1503,44 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
     );
 
     yield* Effect.forEach(
-      ["x.ai/session_notification", "_x.ai/session_notification", "_x.ai/session/update"] as const,
+      xAiSessionNotificationMethods,
       (method) =>
-        runtime.handleExtNotification(method, XAiSessionUpdateNotification, (notification) => {
-          const complete = xAiPromptCompleteFromSessionUpdate(notification);
-          if (complete === null) {
-            return Effect.void;
-          }
-          return settleFromPromptComplete(complete);
-        }),
+        runtime.handleExtNotification(method, Schema.Unknown, (params) =>
+          decodeXAiSessionUpdateNotification(params).pipe(
+            Effect.flatMap((notification) => {
+              const complete = xAiPromptCompleteFromSessionUpdate(notification);
+              return complete === null ? Effect.void : settleFromPromptComplete(complete);
+            }),
+            Effect.ignore,
+            Effect.andThen(
+              Effect.suspend(
+                () => sessionNotificationHandlers.get(method)?.(params) ?? Effect.void,
+              ),
+            ),
+          ),
+        ),
       { discard: true },
     );
 
     return {
       ...runtime,
+      handleExtNotification: (method, payload, handler) =>
+        xAiSessionNotificationMethods.some((owned) => owned === method)
+          ? Effect.sync(() => {
+              sessionNotificationHandlers.set(method, (params) =>
+                Schema.decodeUnknownEffect(payload)(params).pipe(
+                  Effect.mapError((error) =>
+                    EffectAcpErrors.AcpProtocolParseError.fromSchemaError(
+                      "decode-notification-payload",
+                      method,
+                      error,
+                    ),
+                  ),
+                  Effect.flatMap(handler),
+                ),
+              );
+            })
+          : runtime.handleExtNotification(method, payload, handler),
       prompt: (payload, promptOptions?) =>
         Effect.gen(function* () {
           const started = yield* runtime.start();

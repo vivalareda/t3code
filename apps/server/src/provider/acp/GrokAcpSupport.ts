@@ -32,18 +32,32 @@ interface GrokAcpRuntimeInput extends Omit<
   readonly runtimeMode?: RuntimeMode;
 }
 
+/**
+ * The runtime modes `grok agent` can launch in: ask, its auto classifier, and
+ * always-approve. It has no Auto-accept edits: `acceptEdits` only exists as a
+ * settings-file `permissions.defaultMode`, and `grok agent` treats it as ask.
+ */
+export const GROK_SUPPORTED_RUNTIME_MODES = [
+  "approval-required",
+  "auto",
+  "full-access",
+] as const satisfies ReadonlyArray<RuntimeMode>;
+
+/**
+ * Launch argv for a runtime mode. `--permission-mode` on the argv beats the
+ * user's Grok config, so Supervised cannot inherit a configured always-approve.
+ * A mode Grok does not offer launches asking.
+ */
 export function grokAcpSpawnArgs(runtimeMode?: RuntimeMode): ReadonlyArray<string> {
   switch (runtimeMode) {
-    case "approval-required":
-      return ["--permission-mode", "default", "agent", "stdio"];
-    case "auto-accept-edits":
-      return ["--permission-mode", "acceptEdits", "agent", "stdio"];
+    case undefined:
+      return ["agent", "stdio"];
     case "auto":
       return ["--permission-mode", "auto", "agent", "stdio"];
     case "full-access":
       return ["agent", "--always-approve", "stdio"];
     default:
-      return ["agent", "stdio"];
+      return ["--permission-mode", "default", "agent", "stdio"];
   }
 }
 
@@ -92,6 +106,15 @@ export function grokAcpRuntimeProcessOwnership(
  */
 export const GROK_ACP_CANCEL_META = { cancelTrigger: "ctrl_c" } as const;
 
+/**
+ * Grok's Auto mode asks the client about an action its classifier blocks only
+ * when the client declares a type that can show a prompt; the default
+ * (`generic`) gets a silent denial instead. `extension` is the prompting type
+ * that keeps the permission options T3 already maps (no always-approve row,
+ * no per-command persistent grants).
+ */
+export const GROK_ACP_INITIALIZE_META = { clientType: "extension" } as const;
+
 export const makeGrokAcpRuntime = (
   input: GrokAcpRuntimeInput,
 ): Effect.Effect<
@@ -114,6 +137,7 @@ export const makeGrokAcpRuntime = (
         ),
         authMethodId: resolveGrokAuthMethodId(input.environment),
         cancelMeta: { ...input.cancelMeta, ...GROK_ACP_CANCEL_META },
+        initializeMeta: GROK_ACP_INITIALIZE_META,
         ...grokAcpRuntimeProcessOwnership(processGroupPlatform),
       }).pipe(
         Layer.provide(
