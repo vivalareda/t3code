@@ -131,6 +131,8 @@ import { useThreadActions } from "../hooks/useThreadActions";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useTerminalFocus } from "../hooks/useTerminalFocus";
 import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
+import { selectLeaderAwaitingKey, useLeaderKeyStore } from "../leaderKeyStore";
+import { onThreadJumpRequest } from "../threadJumpBus";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
 import { useClientSettings } from "../hooks/useSettings";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
@@ -2886,16 +2888,20 @@ export default function Sidebar() {
   const snoozedThreadKeysRef = useRef(snoozedThreadKeys);
   snoozedThreadKeysRef.current = snoozedThreadKeys;
 
+  const leaderAwaitingKey = useLeaderKeyStore(selectLeaderAwaitingKey);
   const jumpLabelByKey = useMemo(() => {
     const mapping = new Map<string, string>();
     for (const [index, threadKey] of orderedThreadKeys.entries()) {
       const jumpCommand = threadJumpCommandForIndex(index);
       if (!jumpCommand) break;
-      const label = shortcutLabelForCommand(keybindings, jumpCommand);
+      // After Space, the badge is the digit that completes the leader sequence.
+      const label = leaderAwaitingKey
+        ? String(index + 1)
+        : shortcutLabelForCommand(keybindings, jumpCommand);
       if (label) mapping.set(threadKey, label);
     }
     return mapping;
-  }, [keybindings, orderedThreadKeys]);
+  }, [keybindings, leaderAwaitingKey, orderedThreadKeys]);
   const { showThreadJumpHints: showJumpHints, updateThreadJumpHintsVisibility } =
     useThreadJumpHintVisibility();
 
@@ -4444,6 +4450,18 @@ export default function Sidebar() {
     threadByKey,
   ]);
 
+  // Space 1–9: the leader asks for the jump; the sidebar owns the order.
+  useEffect(
+    () =>
+      onThreadJumpRequest((index) => {
+        const targetThreadKey = orderedThreadKeys[index];
+        const targetThread = targetThreadKey ? threadByKey.get(targetThreadKey) : undefined;
+        if (!targetThread) return;
+        navigateToThread(scopeThreadRef(targetThread.environmentId, targetThread.id));
+      }),
+    [navigateToThread, orderedThreadKeys, threadByKey],
+  );
+
   // Same predicate as v1: hints show only while the held modifiers exactly
   // match a thread-jump binding. Adding Shift (screenshots) or Alt no
   // longer matches ⌘1..9, so the overlay hides for chords like ⌘⇧4.
@@ -4464,8 +4482,8 @@ export default function Sidebar() {
     },
   );
   useEffect(() => {
-    updateThreadJumpHintsVisibility(shouldShowJumpHintsNow);
-  }, [shouldShowJumpHintsNow, updateThreadJumpHintsVisibility]);
+    updateThreadJumpHintsVisibility(shouldShowJumpHintsNow || leaderAwaitingKey);
+  }, [leaderAwaitingKey, shouldShowJumpHintsNow, updateThreadJumpHintsVisibility]);
 
   // New thread defaults to the project you're in (active thread's project,
   // falling back to the top project) — same resolution the command palette

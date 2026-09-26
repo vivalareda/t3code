@@ -25,6 +25,7 @@ import {
   isVimIdleNormal,
 } from "~/lib/composerVim";
 import { collectInlineContextIds } from "~/lib/composerContextReferences";
+import { takeComposerNormalMode } from "~/lib/composerRestMode";
 import { cn } from "~/lib/utils";
 import { getTimelinePageScrollKey } from "./chat/pageScrollController";
 import { importPastedComposerText } from "./composerInlineTokenPaste";
@@ -71,6 +72,14 @@ function enterInsertMode(view: EditorView): void {
   if (!cm || !state || state.insertMode) return;
   if (state.visualMode) Vim.exitVisualMode(cm);
   Vim.handleKey(cm, "i", "api");
+}
+
+function exitToNormalMode(view: EditorView): void {
+  const cm = getCM(view) as CodeMirrorV | null;
+  const state = cm?.state.vim;
+  if (!cm || !state) return;
+  if (state.visualMode) Vim.exitVisualMode(cm);
+  if (state.insertMode) Vim.exitInsertMode(cm);
 }
 
 /** Smallest single change turning `from` into `to`, so undo and marks survive rewrites. */
@@ -280,7 +289,17 @@ export function ComposerPromptEditorVim(props: ComposerPromptEditorProps) {
         doc: value,
         selection: { anchor: snapshotRef.current.expandedCursor },
         extensions: [
-          Prec.highest(EditorView.domEventHandlers({ keydown: handleKeyDown, paste: handlePaste })),
+          Prec.highest(
+            EditorView.domEventHandlers({
+              keydown: handleKeyDown,
+              paste: handlePaste,
+              // Focus returned by a popup Escape closed rests in normal mode.
+              focus: (_event, focusedView) => {
+                if (takeComposerNormalMode()) exitToNormalMode(focusedView);
+                return false;
+              },
+            }),
+          ),
           vim(),
           history(),
           keymap.of([...defaultKeymap, ...historyKeymap]),
@@ -406,8 +425,11 @@ export function ComposerPromptEditorVim(props: ComposerPromptEditorProps) {
   const focusAt = useCallback((nextCursor: number) => {
     const view = viewRef.current;
     if (!view) return;
+    // Taken before focusing so the focus handler above sees it already spent.
+    const restInNormalMode = takeComposerNormalMode();
     view.focus();
-    enterInsertMode(view);
+    if (restInNormalMode) exitToNormalMode(view);
+    else enterInsertMode(view);
     // A newer prompt is waiting to be applied; its rewrite places the caret.
     if (snapshotRef.current.value !== latestValueRef.current) return;
     const snapshot = snapshotRef.current;

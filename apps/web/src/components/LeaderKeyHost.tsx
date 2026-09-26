@@ -1,11 +1,14 @@
-import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useMemo, useState } from "react";
 
 import { openCommandPalette } from "../commandPaletteBus";
 import { useComposerHandleContext } from "../composerHandleContext";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useClientSettings, useLegacySidebarEnabled } from "../hooks/useSettings";
+import { threadJumpIndexFromCommand } from "../keybindings";
+import { useLeaderKeyStore } from "../leaderKeyStore";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
-import { isComposerVimIdleNormal } from "../lib/composerVim";
+import { armComposerNormalMode, dropComposerNormalMode } from "../lib/composerRestMode";
+import { COMPOSER_VIM_EDITOR_SELECTOR, isComposerVimIdleNormal } from "../lib/composerVim";
 import { isEditableFocused } from "../lib/editableFocus";
 import { isFloatingLayerOpen } from "../lib/floatingLayer";
 import { leaderContinuations, stepLeaderKey, type LeaderCommand } from "../lib/leaderKey";
@@ -14,10 +17,17 @@ import { selectProjectGroupingSettings } from "../logicalProject";
 import { buildSidebarProjectSnapshots } from "../sidebarProjectGrouping";
 import { useProjects } from "../state/entities";
 import { usePrimaryEnvironmentId } from "../state/environments";
+import { requestThreadJump } from "../threadJumpBus";
 import { Kbd, KbdGroup } from "./ui/kbd";
 
 /** How long a sequence rests before the which-key popup lists its continuations. */
 const WHICH_KEY_DELAY_MS = 400;
+
+function isPlainEscape(event: KeyboardEvent): boolean {
+  return (
+    event.key === "Escape" && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+  );
+}
 
 /**
  * Listens for the Space leader on every screen and runs its commands. Sits
@@ -43,11 +53,13 @@ export function LeaderKeyHost() {
     [primaryEnvironmentId, projectGroupingSettings, projects],
   );
   const [hintSequence, setHintSequence] = useState<string | null>(null);
-  const pendingRef = useRef<string | null>(null);
-  const hintTimerRef = useRef<number | null>(null);
-  const swallowSpaceKeyUpRef = useRef(false);
 
   const runCommand = useEffectEvent((command: LeaderCommand) => {
+    const jumpIndex = threadJumpIndexFromCommand(command);
+    if (jumpIndex !== null) {
+      requestThreadJump(jumpIndex);
+      return;
+    }
     switch (command) {
       case "palette.open":
         openCommandPalette();
@@ -72,33 +84,44 @@ export function LeaderKeyHost() {
           handleNewThread,
         });
         return;
+      default:
+        return;
     }
   });
 
   useEffect(() => {
+    const { setPending } = useLeaderKeyStore.getState();
+    const readPending = () => useLeaderKeyStore.getState().pending;
+    let hintTimer: number | null = null;
+    let swallowSpaceKeyUp = false;
+
     const clearHintTimer = () => {
-      if (hintTimerRef.current !== null) window.clearTimeout(hintTimerRef.current);
-      hintTimerRef.current = null;
+      if (hintTimer !== null) window.clearTimeout(hintTimer);
+      hintTimer = null;
     };
     const settle = (sequence: string | null) => {
-      pendingRef.current = sequence;
+      setPending(sequence);
       clearHintTimer();
       setHintSequence(null);
       if (sequence === null) return;
-      hintTimerRef.current = window.setTimeout(() => setHintSequence(sequence), WHICH_KEY_DELAY_MS);
+      hintTimer = window.setTimeout(() => setHintSequence(sequence), WHICH_KEY_DELAY_MS);
     };
     const cancel = () => {
-      if (pendingRef.current !== null) settle(null);
+      if (readPending() !== null) settle(null);
     };
     const consume = (event: KeyboardEvent) => {
       event.preventDefault();
       event.stopPropagation();
       // Buttons and role="button" rows click on the Space keyup.
-      if (event.key === " ") swallowSpaceKeyUpRef.current = true;
+      if (event.key === " ") swallowSpaceKeyUp = true;
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
-      const step = stepLeaderKey(pendingRef.current, event, () => ({
+      // Escape closing a popup: the composer rests in normal mode when focus
+      // comes back to it, so another sequence can follow straight away.
+      if (isPlainEscape(event) && isFloatingLayerOpen()) armComposerNormalMode();
+      const pending = readPending();
+      const step = stepLeaderKey(pending, event, () => ({
         editableFocus: isEditableFocused(event.target) || isTerminalFocused(),
         composerNormalMode: isComposerVimIdleNormal(event.target),
         floatingLayerOpen: isFloatingLayerOpen(),
@@ -108,7 +131,7 @@ export function LeaderKeyHost() {
           return;
         case "pending":
           consume(event);
-          if (step.sequence !== pendingRef.current) settle(step.sequence);
+          if (step.sequence !== pending) settle(step.sequence);
           return;
         case "command":
           consume(event);
@@ -122,13 +145,24 @@ export function LeaderKeyHost() {
       }
     };
     const onKeyUp = (event: KeyboardEvent) => {
-      if (event.key !== " " || !swallowSpaceKeyUpRef.current) return;
-      swallowSpaceKeyUpRef.current = false;
+      if (event.key !== " " || !swallowSpaceKeyUp) return;
+      swallowSpaceKeyUp = false;
       event.preventDefault();
       event.stopPropagation();
     };
+    const onFocusIn = (event: FocusEvent) => {
+      // Focus landing anywhere but the composer ends the Escape hand-off.
+      const target = event.target;
+      if (!(target instanceof Element && target.closest(COMPOSER_VIM_EDITOR_SELECTOR))) {
+        dropComposerNormalMode();
+      }
+    };
+    const onPointerDown = () => {
+      dropComposerNormalMode();
+      cancel();
+    };
     const onBlur = () => {
-      swallowSpaceKeyUpRef.current = false;
+      swallowSpaceKeyUp = false;
       cancel();
     };
 
@@ -136,14 +170,18 @@ export function LeaderKeyHost() {
     // the composer's own key handling.
     window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("keyup", onKeyUp, true);
-    window.addEventListener("pointerdown", cancel, true);
+    window.addEventListener("focusin", onFocusIn, true);
+    window.addEventListener("pointerdown", onPointerDown, true);
     window.addEventListener("blur", onBlur);
     return () => {
       window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("keyup", onKeyUp, true);
-      window.removeEventListener("pointerdown", cancel, true);
+      window.removeEventListener("focusin", onFocusIn, true);
+      window.removeEventListener("pointerdown", onPointerDown, true);
       window.removeEventListener("blur", onBlur);
       clearHintTimer();
+      setPending(null);
+      dropComposerNormalMode();
     };
   }, []);
 

@@ -78,6 +78,18 @@ describe("stepLeaderKey", () => {
     });
   });
 
+  it("maps 1 through 9 to the thread jump commands", () => {
+    expect(stepLeaderKey("", key("1"), () => free)).toEqual({
+      kind: "command",
+      command: "thread.jump.1",
+    });
+    expect(stepLeaderKey("", key("9"), () => free)).toEqual({
+      kind: "command",
+      command: "thread.jump.9",
+    });
+    expect(stepLeaderKey("", key("0"), () => free)).toEqual({ kind: "cancel", consume: true });
+  });
+
   it("cancels on Esc or an unmapped key and swallows it", () => {
     expect(stepLeaderKey("", key("Escape"), () => free)).toEqual({ kind: "cancel", consume: true });
     expect(stepLeaderKey("f", key("x"), () => free)).toEqual({ kind: "cancel", consume: true });
@@ -114,6 +126,7 @@ describe("leaderContinuations", () => {
       { key: "m", label: "Choose model", prefix: false },
       { key: "n", label: "New thread", prefix: false },
       { key: "a", label: "Add project", prefix: false },
+      { key: "1–9", label: "Jump to thread", prefix: false },
     ]);
   });
 

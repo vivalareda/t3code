@@ -5,6 +5,9 @@ import { parseVimrc, type ParsedVimrc } from "./vimrc";
 
 type VimState = NonNullable<CodeMirrorV["state"]["vim"]>;
 
+/** The composer's CodeMirror root; set through `EditorView.editorAttributes`. */
+export const COMPOSER_VIM_EDITOR_SELECTOR = ".composer-vim";
+
 /** Normal mode with nothing typed yet: no operator, count, or partial key. */
 export function isVimIdleNormal(vim: VimState | null | undefined): boolean {
   return (
@@ -22,7 +25,7 @@ export function isVimIdleNormal(vim: VimState | null | undefined): boolean {
  */
 export function isComposerVimIdleNormal(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
-  const editor = target.closest<HTMLElement>(".composer-vim");
+  const editor = target.closest<HTMLElement>(COMPOSER_VIM_EDITOR_SELECTOR);
   const view = editor ? EditorView.findFromDOM(editor) : null;
   const cm = view ? (getCM(view) as CodeMirrorV | null) : null;
   return isVimIdleNormal(cm?.state.vim);

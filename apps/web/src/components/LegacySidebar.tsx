@@ -177,6 +177,8 @@ import {
   useThreadSelectionStore,
 } from "../threadSelectionStore";
 import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
+import { selectLeaderAwaitingKey, useLeaderKeyStore } from "../leaderKeyStore";
+import { onThreadJumpRequest } from "../threadJumpBus";
 import {
   archiveSelectedThreadEntries,
   buildMultiSelectThreadContextMenuItems,
@@ -3520,15 +3522,26 @@ export default function LegacySidebar() {
     terminalOpen: routeTerminalOpen,
     modelPickerOpen: isModelPickerOpen(),
   };
+  const leaderAwaitingKey = useLeaderKeyStore(selectLeaderAwaitingKey);
   const threadJumpLabelByKey = useMemo(
     () =>
-      buildThreadJumpLabelMap({
-        keybindings,
-        platform,
-        terminalOpen: sidebarShortcutContext.terminalOpen,
-        threadJumpCommandByKey,
-      }),
-    [keybindings, platform, sidebarShortcutContext.terminalOpen, threadJumpCommandByKey],
+      // After Space, the badge is the digit that completes the leader sequence.
+      leaderAwaitingKey
+        ? new Map(threadJumpThreadKeys.map((threadKey, index) => [threadKey, String(index + 1)]))
+        : buildThreadJumpLabelMap({
+            keybindings,
+            platform,
+            terminalOpen: sidebarShortcutContext.terminalOpen,
+            threadJumpCommandByKey,
+          }),
+    [
+      keybindings,
+      leaderAwaitingKey,
+      platform,
+      sidebarShortcutContext.terminalOpen,
+      threadJumpCommandByKey,
+      threadJumpThreadKeys,
+    ],
   );
   const shouldShowThreadJumpHintsNow = shouldShowThreadJumpHintsForModifiers(
     shortcutModifiers,
@@ -3556,8 +3569,8 @@ export default function LegacySidebar() {
   );
 
   useEffect(() => {
-    updateThreadJumpHintsVisibility(shouldShowThreadJumpHintsNow);
-  }, [shouldShowThreadJumpHintsNow, updateThreadJumpHintsVisibility]);
+    updateThreadJumpHintsVisibility(shouldShowThreadJumpHintsNow || leaderAwaitingKey);
+  }, [leaderAwaitingKey, shouldShowThreadJumpHintsNow, updateThreadJumpHintsVisibility]);
 
   useEffect(() => {
     const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -3626,6 +3639,18 @@ export default function LegacySidebar() {
     sidebarThreadByKey,
     threadJumpThreadKeys,
   ]);
+
+  // Space 1–9: the leader asks for the jump; the sidebar owns the order.
+  useEffect(
+    () =>
+      onThreadJumpRequest((index) => {
+        const targetThreadKey = threadJumpThreadKeys[index];
+        const targetThread = targetThreadKey ? sidebarThreadByKey.get(targetThreadKey) : undefined;
+        if (!targetThread) return;
+        navigateToThread(scopeThreadRef(targetThread.environmentId, targetThread.id));
+      }),
+    [navigateToThread, sidebarThreadByKey, threadJumpThreadKeys],
+  );
 
   useEffect(() => {
     const onMouseDown = (event: globalThis.MouseEvent) => {

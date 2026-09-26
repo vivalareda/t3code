@@ -10,18 +10,22 @@ the web and desktop app, including Settings. The sequence waits for the next key
 with no time limit; pause for a moment and a small popup lists what can follow.
 Esc or any other key cancels it.
 
-| Sequence    | Action                                           |
-| ----------- | ------------------------------------------------ |
-| `Space f f` | Find a thread: opens the command palette         |
-| `Space m`   | Choose a model for the open conversation         |
-| `Space n`   | New thread, the same as the sidebar **+** button |
-| `Space a`   | Add a project                                    |
+| Sequence            | Action                                                    |
+| ------------------- | --------------------------------------------------------- |
+| `Space f f`         | Find a thread: opens the command palette                  |
+| `Space m`           | Choose a model for the open conversation                  |
+| `Space n`           | New thread, the same as the sidebar **+** button          |
+| `Space a`           | Add a project                                             |
+| `Space 1`…`Space 9` | Open the first nine sidebar threads, like `mod+1`…`mod+9` |
 
-Space starts a sequence when no text field has focus, or when the composer is in
-vim normal mode. In insert mode it types a space. It does not fire while a dialog
-or menu is open. The bindings are fixed; the ⌘ and Ctrl shortcuts below are
-unaffected. If your vimrc sets `let mapleader = " "`, choose a different
-composer leader such as `,` because the app owns Space.
+While Space waits for a key, the sidebar shows each thread's digit. Space starts a
+sequence when no text field has focus, or when the composer is in vim normal mode.
+In insert mode it types a space. It does not fire while a dialog or menu is open.
+Closing a dialog with Esc returns the composer to normal mode so another sequence
+can follow; choosing an item with Enter returns it in insert mode. The bindings
+are fixed; the ⌘ and Ctrl shortcuts below are unaffected. If your vimrc sets
+`let mapleader = " "`, choose a different composer leader such as `,` because the
+app owns Space.
 
 ## Composer controls
 

@@ -6,13 +6,25 @@
  * its command, a prefix waits for more, and Esc or any other key cancels.
  */
 
-export type LeaderCommand = "palette.open" | "modelPicker.open" | "thread.new" | "project.add";
+import {
+  THREAD_JUMP_KEYBINDING_COMMANDS,
+  type ThreadJumpKeybindingCommand,
+} from "@t3tools/contracts";
+
+export type LeaderCommand =
+  | "palette.open"
+  | "modelPicker.open"
+  | "thread.new"
+  | "project.add"
+  | ThreadJumpKeybindingCommand;
 
 export interface LeaderBinding {
   /** Keys pressed after Space, in order. */
   readonly keys: string;
   readonly label: string;
   readonly command: LeaderCommand;
+  /** Which-key row shared by a run of keys, such as `1–9`; those keys collapse into one entry. */
+  readonly hint?: string;
 }
 
 export const LEADER_BINDINGS: ReadonlyArray<LeaderBinding> = [
@@ -20,6 +32,13 @@ export const LEADER_BINDINGS: ReadonlyArray<LeaderBinding> = [
   { keys: "m", label: "Choose model", command: "modelPicker.open" },
   { keys: "n", label: "New thread", command: "thread.new" },
   { keys: "a", label: "Add project", command: "project.add" },
+  // Space 1–9 opens the sidebar's first nine threads, like ⌘1–9.
+  ...THREAD_JUMP_KEYBINDING_COMMANDS.map((command, index) => ({
+    keys: String(index + 1),
+    label: "Jump to thread",
+    command,
+    hint: "1–9",
+  })),
 ];
 
 /** Labels for sequences that only lead to further keys. */
@@ -37,12 +56,13 @@ export function leaderContinuations(sequence: string): ReadonlyArray<LeaderHint>
   const hints: LeaderHint[] = [];
   for (const binding of LEADER_BINDINGS) {
     if (!binding.keys.startsWith(sequence) || binding.keys.length === sequence.length) continue;
-    const key = binding.keys[sequence.length]!;
-    if (hints.some((hint) => hint.key === key)) continue;
+    const nextKey = binding.keys[sequence.length]!;
     const prefix = binding.keys.length > sequence.length + 1;
+    const key = !prefix && binding.hint ? binding.hint : nextKey;
+    if (hints.some((hint) => hint.key === key)) continue;
     hints.push({
       key,
-      label: prefix ? (LEADER_PREFIX_LABELS[sequence + key] ?? key) : binding.label,
+      label: prefix ? (LEADER_PREFIX_LABELS[sequence + nextKey] ?? nextKey) : binding.label,
       prefix,
     });
   }
